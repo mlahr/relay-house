@@ -1,0 +1,15 @@
+services:
+  email-endpoint:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - email-data:/app/data
+    environment:
+      DATABASE_PATH: /app/data/email-endpoint.db
+    restart: unless-stopped
+
+volumes:
+  email-data:
