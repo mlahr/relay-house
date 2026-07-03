@@ -74,6 +74,15 @@ database:
 		t.Fatalf("YAML database path = %q", got)
 	}
 
+	t.Setenv("RELAY_HOUSE_CONFIG", configPath)
+	got, err = eventDatabasePath("", "")
+	if err != nil {
+		t.Fatalf("eventDatabasePath RELAY_HOUSE_CONFIG returned error: %v", err)
+	}
+	if got != "yaml.db" {
+		t.Fatalf("RELAY_HOUSE_CONFIG database path = %q", got)
+	}
+
 	t.Setenv("DATABASE_PATH", "env.db")
 	got, err = eventDatabasePath(configPath, "")
 	if err != nil {
@@ -107,6 +116,16 @@ func TestParseEventCommandOptions(t *testing.T) {
 	}
 	if _, err := parseEventCommandOptions([]string{"-limit", "501"}); err == nil {
 		t.Fatal("parseEventCommandOptions accepted limit 501")
+	}
+}
+
+func TestLoadEventsReportsMissingDatabasePath(t *testing.T) {
+	_, err := loadEvents(eventCommandOptions{DatabasePath: filepath.Join(t.TempDir(), "missing.db"), Limit: 1})
+	if err == nil {
+		t.Fatal("loadEvents returned nil error for missing database")
+	}
+	if !strings.Contains(err.Error(), "does not exist") || !strings.Contains(err.Error(), "pass -config or -database") {
+		t.Fatalf("missing database error = %v", err)
 	}
 }
 
@@ -315,6 +334,23 @@ security:
 	}
 }
 
+func TestConfigExampleYAMLLoads(t *testing.T) {
+	clearConfigEnv(t)
+	cfg, err := loadConfigFromArgs([]string{"--config", filepath.Join("..", "..", "config.example.yaml")})
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs returned error for config.example.yaml: %v", err)
+	}
+	if cfg.ProjectKey != "replace-with-public-project-key" {
+		t.Fatalf("ProjectKey = %q", cfg.ProjectKey)
+	}
+	if cfg.DatabasePath != "relay-house.db" {
+		t.Fatalf("DatabasePath = %q", cfg.DatabasePath)
+	}
+	if cfg.DeliveryProvider != "smtp" || cfg.SMTPHost != "smtp.example.com" {
+		t.Fatalf("provider config = %#v", cfg)
+	}
+}
+
 func TestEnvOverridesYAMLConfig(t *testing.T) {
 	clearConfigEnv(t)
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
@@ -516,6 +552,7 @@ func clearConfigEnv(t *testing.T) {
 		"WORKER_INTERVAL_SECONDS",
 		"RETENTION_DAYS",
 		"IP_HASH_SECRET",
+		"RELAY_HOUSE_CONFIG",
 	}
 	type savedEnv struct {
 		value string

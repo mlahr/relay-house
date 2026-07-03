@@ -1,0 +1,82 @@
+# RelayHouse example configuration.
+#
+# Copy this file and pass it with:
+#   relay-house -config /path/to/config.yaml
+#
+# Environment variables override values from this file. See README.md for the
+# matching environment variable names.
+
+http:
+  # Address the HTTP server listens on.
+  address: 127.0.0.1:8080
+
+database:
+  # SQLite database path. For packaged installs, use:
+  # /var/lib/relay-house/relay-house.db
+  path: relay-house.db
+
+project:
+  # Public project identifier sent by browser JavaScript in the JSON "project"
+  # field. This is not a secret, but it should be stable across restarts.
+  key: replace-with-public-project-key
+  name: main
+
+  # Exact browser Origin values allowed to submit forms.
+  allowed_origins:
+    - https://example.com
+    - https://www.example.com
+
+  # Server-controlled destination addresses. The browser cannot choose
+  # recipients.
+  recipients:
+    - Website Owner <you@example.com>
+
+mail:
+  # Server-controlled From header used for outgoing email.
+  from: Website Contact <contact@example.com>
+
+  # Supported values: smtp, mailtrap.
+  delivery_provider: smtp
+
+  smtp:
+    # Required when delivery_provider is smtp.
+    host: smtp.example.com
+    port: 587
+    username: smtp-user
+    password: smtp-password
+
+    # Set true only for SMTP servers that require plaintext auth without TLS.
+    insecure_plain_auth: false
+
+  mailtrap:
+    # Required when delivery_provider is mailtrap.
+    api_url: https://send.api.mailtrap.io/api/send
+    api_token: ""
+
+    # Optional blind-copy recipients for Mailtrap API delivery.
+    bcc: []
+
+turnstile:
+  # Optional Cloudflare Turnstile secret. If set, each request must include
+  # turnstileToken.
+  secret: ""
+
+rate_limit:
+  # Per project and hashed client IP.
+  per_minute: 5
+  per_day: 100
+
+worker:
+  # Failed deliveries retry with exponential backoff until max_retries.
+  max_retries: 5
+  interval_seconds: 5
+
+retention:
+  # Sent and dead submissions older than this are deleted by the worker.
+  # Set 0 to disable retention cleanup.
+  days: 365
+
+security:
+  # Secret used to hash client IPs for rate limiting. Use a long random value
+  # and keep it stable across restarts.
+  ip_hash_secret: replace-with-random-secret

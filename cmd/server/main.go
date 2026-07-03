@@ -37,6 +37,8 @@ import (
 
 var version = "dev"
 
+const packagedConfigPath = "/etc/relay-house/config.yaml"
+
 type Config struct {
 	Addr              string
 	DatabasePath      string
@@ -381,6 +383,12 @@ func parseEventCommandOptions(args []string) (eventCommandOptions, error) {
 
 func eventDatabasePath(configPath, databaseOverride string) (string, error) {
 	cfg := defaultConfig()
+	if configPath == "" {
+		configPath = os.Getenv("RELAY_HOUSE_CONFIG")
+	}
+	if configPath == "" && fileExists(packagedConfigPath) {
+		configPath = packagedConfigPath
+	}
 	if configPath != "" {
 		if err := applyYAMLConfig(&cfg, configPath); err != nil {
 			return "", err
@@ -392,6 +400,9 @@ func eventDatabasePath(configPath, databaseOverride string) (string, error) {
 }
 
 func loadEvents(opts eventCommandOptions) ([]eventRow, error) {
+	if !fileExists(opts.DatabasePath) {
+		return nil, fmt.Errorf("database file %q does not exist; pass -config or -database", opts.DatabasePath)
+	}
 	db, err := sql.Open("sqlite", readOnlySQLiteDSN(opts.DatabasePath))
 	if err != nil {
 		return nil, err
@@ -408,6 +419,11 @@ func readOnlySQLiteDSN(path string) string {
 	q.Set("_pragma", "busy_timeout(5000)")
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func queryEvents(ctx context.Context, db *sql.DB, limit int) ([]eventRow, error) {
