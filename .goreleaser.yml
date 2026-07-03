@@ -1,0 +1,85 @@
+version: 2
+
+project_name: email-endpoint
+
+builds:
+  - id: email-endpoint
+    main: ./cmd/server
+    binary: email-endpoint
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: tarball
+    ids:
+      - email-endpoint
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+nfpms:
+  - id: deb
+    package_name: email-endpoint
+    ids:
+      - email-endpoint
+    formats:
+      - deb
+    maintainer: "Michael Lahr"
+    description: "Self-hosted email endpoint for browser-based website forms."
+    homepage: "https://github.com/mlahr/email-endpoint"
+    section: mail
+    priority: optional
+    bindir: /usr/bin
+    dependencies:
+      - adduser
+      - ca-certificates
+      - lsb-base
+    contents:
+      - src: packaging/debian/email-endpoint.config.yaml
+        dst: /etc/email-endpoint/config.yaml
+        type: config|noreplace
+        file_info:
+          mode: 0640
+      - src: packaging/debian/email-endpoint.default
+        dst: /etc/default/email-endpoint
+        type: config|noreplace
+        file_info:
+          mode: 0644
+      - src: packaging/debian/email-endpoint.init
+        dst: /etc/init.d/email-endpoint
+        file_info:
+          mode: 0755
+      - src: packaging/debian/email-endpoint.service
+        dst: /lib/systemd/system/email-endpoint.service
+        file_info:
+          mode: 0644
+      - dst: /var/lib/email-endpoint
+        type: dir
+        file_info:
+          mode: 0750
+      - dst: /run/email-endpoint
+        type: dir
+        file_info:
+          mode: 0755
+    scripts:
+      postinstall: packaging/debian/postinstall.sh
+      preremove: packaging/debian/preremove.sh
+      postremove: packaging/debian/postremove.sh
+
+release:
+  github:
+    owner: mlahr
+    name: email-endpoint
+  extra_files:
+    - glob: ./install.sh

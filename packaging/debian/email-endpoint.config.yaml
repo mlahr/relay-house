@@ -1,0 +1,47 @@
+http:
+  address: 127.0.0.1:8080
+
+database:
+  path: /var/lib/email-endpoint/email-endpoint.db
+
+project:
+  key: replace-with-public-project-key
+  name: main
+  allowed_origins:
+    - https://example.com
+    - https://www.example.com
+  recipients:
+    - you@example.com
+
+mail:
+  from: Website Contact <contact@example.com>
+  delivery_provider: smtp
+
+  smtp:
+    host: smtp.example.com
+    port: 587
+    username: smtp-user
+    password: smtp-password
+    insecure_plain_auth: false
+
+  mailtrap:
+    api_url: https://send.api.mailtrap.io/api/send
+    api_token: ""
+    bcc: []
+
+turnstile:
+  secret: ""
+
+rate_limit:
+  per_minute: 5
+  per_day: 100
+
+worker:
+  max_retries: 5
+  interval_seconds: 5
+
+retention:
+  days: 365
+
+security:
+  ip_hash_secret: replace-with-random-secret

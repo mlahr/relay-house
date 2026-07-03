@@ -10,7 +10,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net"
@@ -28,12 +30,16 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"gopkg.in/yaml.v3"
 	_ "modernc.org/sqlite"
 )
+
+var version = "dev"
 
 type Config struct {
 	Addr              string
 	DatabasePath      string
+	DeliveryProvider  string
 	ProjectKey        string
 	ProjectName       string
 	AllowedOrigins    []string
@@ -44,6 +50,9 @@ type Config struct {
 	SMTPUsername      string
 	SMTPPassword      string
 	SMTPInsecurePlain bool
+	MailtrapAPIURL    string
+	MailtrapAPIToken  string
+	MailtrapBCC       []string
 	TurnstileSecret   string
 	RateMinute        int
 	RateDay           int
@@ -87,9 +96,68 @@ type job struct {
 	AttemptCount int
 }
 
+type deliveryResult struct {
+	Provider string
+	Response string
+	Err      error
+}
+
+type mailtrapAddress struct {
+	Email string `json:"email"`
+	Name  string `json:"name,omitempty"`
+}
+
+type fileConfig struct {
+	HTTP struct {
+		Address string `yaml:"address"`
+	} `yaml:"http"`
+	Database struct {
+		Path string `yaml:"path"`
+	} `yaml:"database"`
+	Project struct {
+		Key            string   `yaml:"key"`
+		Name           string   `yaml:"name"`
+		AllowedOrigins []string `yaml:"allowed_origins"`
+		Recipients     []string `yaml:"recipients"`
+	} `yaml:"project"`
+	Mail struct {
+		From             string `yaml:"from"`
+		DeliveryProvider string `yaml:"delivery_provider"`
+		SMTP             struct {
+			Host          string `yaml:"host"`
+			Port          int    `yaml:"port"`
+			Username      string `yaml:"username"`
+			Password      string `yaml:"password"`
+			InsecurePlain bool   `yaml:"insecure_plain_auth"`
+		} `yaml:"smtp"`
+		Mailtrap struct {
+			APIURL   string   `yaml:"api_url"`
+			APIToken string   `yaml:"api_token"`
+			BCC      []string `yaml:"bcc"`
+		} `yaml:"mailtrap"`
+	} `yaml:"mail"`
+	Turnstile struct {
+		Secret string `yaml:"secret"`
+	} `yaml:"turnstile"`
+	RateLimit struct {
+		PerMinute int `yaml:"per_minute"`
+		PerDay    int `yaml:"per_day"`
+	} `yaml:"rate_limit"`
+	Worker struct {
+		MaxRetries      int `yaml:"max_retries"`
+		IntervalSeconds int `yaml:"interval_seconds"`
+	} `yaml:"worker"`
+	Retention struct {
+		Days int `yaml:"days"`
+	} `yaml:"retention"`
+	Security struct {
+		IPHashSecret string `yaml:"ip_hash_secret"`
+	} `yaml:"security"`
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	cfg, err := loadConfig()
+	cfg, err := loadConfigFromArgs(os.Args[1:])
 	if err != nil {
 		logger.Error("config.invalid", "error", err)
 		os.Exit(1)
@@ -158,28 +226,135 @@ func main() {
 }
 
 func loadConfig() (Config, error) {
-	cfg := Config{
-		Addr:            env("ADDR", ":8080"),
-		DatabasePath:    env("DATABASE_PATH", "email-endpoint.db"),
-		ProjectKey:      env("PROJECT_KEY", ""),
-		ProjectName:     env("PROJECT_NAME", "default"),
-		AllowedOrigins:  splitCSV(env("ALLOWED_ORIGINS", "")),
-		Recipients:      splitCSV(env("RECIPIENTS", "")),
-		From:            env("MAIL_FROM", ""),
-		SMTPHost:        env("SMTP_HOST", ""),
-		SMTPPort:        envInt("SMTP_PORT", 587),
-		SMTPUsername:    env("SMTP_USERNAME", ""),
-		SMTPPassword:    env("SMTP_PASSWORD", ""),
-		TurnstileSecret: env("TURNSTILE_SECRET", ""),
-		RateMinute:      envInt("RATE_LIMIT_PER_MINUTE", 5),
-		RateDay:         envInt("RATE_LIMIT_PER_DAY", 100),
-		MaxRetries:      envInt("MAX_RETRIES", 5),
-		WorkerInterval:  time.Duration(envInt("WORKER_INTERVAL_SECONDS", 5)) * time.Second,
-		RetentionDays:   envInt("RETENTION_DAYS", 365),
-		IPHashSecret:    env("IP_HASH_SECRET", ""),
-	}
-	cfg.SMTPInsecurePlain = envBool("SMTP_INSECURE_PLAIN_AUTH", false)
+	return loadConfigFromArgs(nil)
+}
 
+func loadConfigFromArgs(args []string) (Config, error) {
+	fs := flag.NewFlagSet("email-endpoint", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	configPath := fs.String("config", "", "path to YAML config file")
+	showVersion := fs.Bool("version", false, "print version")
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	if *showVersion {
+		fmt.Printf("email-endpoint %s\n", version)
+		os.Exit(0)
+	}
+
+	cfg := defaultConfig()
+	if *configPath != "" {
+		if err := applyYAMLConfig(&cfg, *configPath); err != nil {
+			return Config{}, err
+		}
+	}
+	if err := applyEnvConfig(&cfg); err != nil {
+		return Config{}, err
+	}
+	return validateConfig(cfg)
+}
+
+func defaultConfig() Config {
+	return Config{
+		Addr:             ":8080",
+		DatabasePath:     "email-endpoint.db",
+		DeliveryProvider: "smtp",
+		ProjectName:      "default",
+		SMTPPort:         587,
+		MailtrapAPIURL:   "https://send.api.mailtrap.io/api/send",
+		RateMinute:       5,
+		RateDay:          100,
+		MaxRetries:       5,
+		WorkerInterval:   5 * time.Second,
+		RetentionDays:    365,
+	}
+}
+
+func applyYAMLConfig(cfg *Config, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var file fileConfig
+	if err := yaml.Unmarshal(data, &file); err != nil {
+		return err
+	}
+
+	setString(&cfg.Addr, file.HTTP.Address)
+	setString(&cfg.DatabasePath, file.Database.Path)
+	setString(&cfg.ProjectKey, file.Project.Key)
+	setString(&cfg.ProjectName, file.Project.Name)
+	setStrings(&cfg.AllowedOrigins, file.Project.AllowedOrigins)
+	setStrings(&cfg.Recipients, file.Project.Recipients)
+	setString(&cfg.From, file.Mail.From)
+	setString(&cfg.DeliveryProvider, strings.ToLower(file.Mail.DeliveryProvider))
+	setString(&cfg.SMTPHost, file.Mail.SMTP.Host)
+	setInt(&cfg.SMTPPort, file.Mail.SMTP.Port)
+	setString(&cfg.SMTPUsername, file.Mail.SMTP.Username)
+	setString(&cfg.SMTPPassword, file.Mail.SMTP.Password)
+	cfg.SMTPInsecurePlain = file.Mail.SMTP.InsecurePlain
+	setString(&cfg.MailtrapAPIURL, file.Mail.Mailtrap.APIURL)
+	setString(&cfg.MailtrapAPIToken, file.Mail.Mailtrap.APIToken)
+	setStrings(&cfg.MailtrapBCC, file.Mail.Mailtrap.BCC)
+	setString(&cfg.TurnstileSecret, file.Turnstile.Secret)
+	setInt(&cfg.RateMinute, file.RateLimit.PerMinute)
+	setInt(&cfg.RateDay, file.RateLimit.PerDay)
+	setInt(&cfg.MaxRetries, file.Worker.MaxRetries)
+	if file.Worker.IntervalSeconds > 0 {
+		cfg.WorkerInterval = time.Duration(file.Worker.IntervalSeconds) * time.Second
+	}
+	setInt(&cfg.RetentionDays, file.Retention.Days)
+	setString(&cfg.IPHashSecret, file.Security.IPHashSecret)
+	return nil
+}
+
+func applyEnvConfig(cfg *Config) error {
+	setStringFromEnv(&cfg.Addr, "ADDR")
+	setStringFromEnv(&cfg.DatabasePath, "DATABASE_PATH")
+	setLowerStringFromEnv(&cfg.DeliveryProvider, "DELIVERY_PROVIDER")
+	setStringFromEnv(&cfg.ProjectKey, "PROJECT_KEY")
+	setStringFromEnv(&cfg.ProjectName, "PROJECT_NAME")
+	setCSVFromEnv(&cfg.AllowedOrigins, "ALLOWED_ORIGINS")
+	setCSVFromEnv(&cfg.Recipients, "RECIPIENTS")
+	setStringFromEnv(&cfg.From, "MAIL_FROM")
+	setStringFromEnv(&cfg.SMTPHost, "SMTP_HOST")
+	if err := setIntFromEnv(&cfg.SMTPPort, "SMTP_PORT"); err != nil {
+		return err
+	}
+	setStringFromEnv(&cfg.SMTPUsername, "SMTP_USERNAME")
+	setStringFromEnv(&cfg.SMTPPassword, "SMTP_PASSWORD")
+	if err := setBoolFromEnv(&cfg.SMTPInsecurePlain, "SMTP_INSECURE_PLAIN_AUTH"); err != nil {
+		return err
+	}
+	setStringFromEnv(&cfg.MailtrapAPIURL, "MAILTRAP_API_URL")
+	setStringFromEnv(&cfg.MailtrapAPIToken, "MAILTRAP_API_TOKEN")
+	setCSVFromEnv(&cfg.MailtrapBCC, "MAILTRAP_BCC")
+	setStringFromEnv(&cfg.TurnstileSecret, "TURNSTILE_SECRET")
+	if err := setIntFromEnv(&cfg.RateMinute, "RATE_LIMIT_PER_MINUTE"); err != nil {
+		return err
+	}
+	if err := setIntFromEnv(&cfg.RateDay, "RATE_LIMIT_PER_DAY"); err != nil {
+		return err
+	}
+	if err := setIntFromEnv(&cfg.MaxRetries, "MAX_RETRIES"); err != nil {
+		return err
+	}
+	if value, ok := os.LookupEnv("WORKER_INTERVAL_SECONDS"); ok {
+		seconds, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("WORKER_INTERVAL_SECONDS must be an integer: %w", err)
+		}
+		cfg.WorkerInterval = time.Duration(seconds) * time.Second
+	}
+	if err := setIntFromEnv(&cfg.RetentionDays, "RETENTION_DAYS"); err != nil {
+		return err
+	}
+	setStringFromEnv(&cfg.IPHashSecret, "IP_HASH_SECRET")
+	return nil
+}
+
+func validateConfig(cfg Config) (Config, error) {
+	cfg.DeliveryProvider = strings.ToLower(strings.TrimSpace(cfg.DeliveryProvider))
 	if cfg.ProjectKey == "" {
 		generated, err := randomToken(24)
 		if err != nil {
@@ -196,11 +371,23 @@ func loadConfig() (Config, error) {
 	if cfg.From == "" {
 		return Config{}, errors.New("MAIL_FROM is required")
 	}
-	if cfg.SMTPHost == "" {
-		return Config{}, errors.New("SMTP_HOST is required")
-	}
-	if cfg.SMTPUsername == "" || cfg.SMTPPassword == "" {
-		return Config{}, errors.New("SMTP_USERNAME and SMTP_PASSWORD are required")
+	switch cfg.DeliveryProvider {
+	case "smtp":
+		if cfg.SMTPHost == "" {
+			return Config{}, errors.New("SMTP_HOST is required when DELIVERY_PROVIDER=smtp")
+		}
+		if cfg.SMTPUsername == "" || cfg.SMTPPassword == "" {
+			return Config{}, errors.New("SMTP_USERNAME and SMTP_PASSWORD are required when DELIVERY_PROVIDER=smtp")
+		}
+	case "mailtrap":
+		if cfg.MailtrapAPIToken == "" {
+			return Config{}, errors.New("MAILTRAP_API_TOKEN is required when DELIVERY_PROVIDER=mailtrap")
+		}
+		if cfg.MailtrapAPIURL == "" {
+			return Config{}, errors.New("MAILTRAP_API_URL is required when DELIVERY_PROVIDER=mailtrap")
+		}
+	default:
+		return Config{}, fmt.Errorf("unsupported DELIVERY_PROVIDER %q", cfg.DeliveryProvider)
 	}
 	if cfg.IPHashSecret == "" {
 		generated, err := randomToken(32)
@@ -589,15 +776,15 @@ func (a *App) claimJob(ctx context.Context) (job, bool, error) {
 func (a *App) deliverJob(ctx context.Context, j job) {
 	start := a.now()
 	attemptNumber := j.AttemptCount + 1
-	err := a.sendSMTP(j)
+	result := a.deliver(ctx, j)
 	duration := time.Since(start).Milliseconds()
 
 	now := a.now().UTC().Format(time.RFC3339Nano)
 	status := "sent"
 	errorText := ""
-	if err != nil {
+	if result.Err != nil {
 		status = "failed"
-		errorText = err.Error()
+		errorText = result.Err.Error()
 	}
 
 	tx, txErr := a.db.BeginTx(ctx, nil)
@@ -611,14 +798,14 @@ func (a *App) deliverJob(ctx context.Context, j job) {
 		INSERT INTO delivery_attempts (
 			id, job_id, submission_id, attempt_number, status, provider,
 			response, error, duration_ms, created_at
-		) VALUES (?, ?, ?, ?, ?, 'smtp', ?, ?, ?, ?)
-	`, uuid.NewString(), j.ID, j.SubmissionID, attemptNumber, status, successfulResponse(err), nullableString(errorText), duration, now)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, uuid.NewString(), j.ID, j.SubmissionID, attemptNumber, status, result.Provider, nullableString(result.Response), nullableString(errorText), duration, now)
 	if txErr != nil {
 		a.log.Error("attempt.store_failed", "job_id", j.ID, "error", txErr)
 		return
 	}
 
-	if err == nil {
+	if result.Err == nil {
 		_, txErr = tx.ExecContext(ctx, `UPDATE delivery_jobs SET status = 'sent', attempt_count = ?, last_error = NULL, updated_at = ? WHERE id = ?`, attemptNumber, now, j.ID)
 		if txErr == nil {
 			_, txErr = tx.ExecContext(ctx, `UPDATE submissions SET status = 'sent', updated_at = ? WHERE id = ?`, now, j.SubmissionID)
@@ -644,11 +831,27 @@ func (a *App) deliverJob(ctx context.Context, j job) {
 		return
 	}
 
-	if err != nil {
-		a.log.Warn("email.delivery_failed", "job_id", j.ID, "submission_id", j.SubmissionID, "attempt", attemptNumber, "error", err)
+	if result.Err != nil {
+		a.log.Warn("email.delivery_failed", "provider", result.Provider, "job_id", j.ID, "submission_id", j.SubmissionID, "attempt", attemptNumber, "error", result.Err)
 		return
 	}
-	a.log.Info("email.sent", "job_id", j.ID, "submission_id", j.SubmissionID, "duration_ms", duration)
+	a.log.Info("email.sent", "provider", result.Provider, "job_id", j.ID, "submission_id", j.SubmissionID, "duration_ms", duration)
+}
+
+func (a *App) deliver(ctx context.Context, j job) deliveryResult {
+	switch a.cfg.DeliveryProvider {
+	case "smtp":
+		err := a.sendSMTP(j)
+		if err != nil {
+			return deliveryResult{Provider: "smtp", Err: err}
+		}
+		return deliveryResult{Provider: "smtp", Response: "accepted by smtp client"}
+	case "mailtrap":
+		response, err := a.sendMailtrap(ctx, j)
+		return deliveryResult{Provider: "mailtrap", Response: response, Err: err}
+	default:
+		return deliveryResult{Provider: a.cfg.DeliveryProvider, Err: fmt.Errorf("unsupported delivery provider %q", a.cfg.DeliveryProvider)}
+	}
 }
 
 func (a *App) sendSMTP(j job) error {
@@ -682,6 +885,84 @@ func (a *App) sendSMTP(j job) error {
 	}
 	addr := net.JoinHostPort(a.cfg.SMTPHost, strconv.Itoa(a.cfg.SMTPPort))
 	return smtp.SendMail(addr, auth, fromAddr.Address, a.cfg.Recipients, msg.Bytes())
+}
+
+func (a *App) sendMailtrap(ctx context.Context, j job) (string, error) {
+	fromAddr, err := mail.ParseAddress(a.cfg.From)
+	if err != nil {
+		return "", fmt.Errorf("invalid MAIL_FROM: %w", err)
+	}
+	replyTo, err := mail.ParseAddress(fmt.Sprintf("%s <%s>", j.Name, j.Email))
+	if err != nil {
+		return "", fmt.Errorf("invalid reply-to: %w", err)
+	}
+
+	type payload struct {
+		From    mailtrapAddress   `json:"from"`
+		To      []mailtrapAddress `json:"to"`
+		BCC     []mailtrapAddress `json:"bcc,omitempty"`
+		ReplyTo mailtrapAddress   `json:"reply_to"`
+		Subject string            `json:"subject"`
+		Text    string            `json:"text"`
+		HTML    string            `json:"html,omitempty"`
+	}
+
+	body := payload{
+		From:    mailtrapAddress{Email: fromAddr.Address, Name: fromAddr.Name},
+		To:      addressesFromEmails(a.cfg.Recipients),
+		BCC:     addressesFromEmails(a.cfg.MailtrapBCC),
+		ReplyTo: mailtrapAddress{Email: replyTo.Address, Name: replyTo.Name},
+		Subject: j.Subject,
+		Text:    j.Message,
+	}
+
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.MailtrapAPIURL, bytes.NewReader(encoded))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.cfg.MailtrapAPIToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	responseBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return "", err
+	}
+	responseText := strings.TrimSpace(string(responseBytes))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if responseText == "" {
+			responseText = resp.Status
+		}
+		return responseText, fmt.Errorf("mailtrap returned %s", resp.Status)
+	}
+	if responseText == "" {
+		responseText = resp.Status
+	}
+	return responseText, nil
+}
+
+func addressesFromEmails(values []string) []mailtrapAddress {
+	addresses := make([]mailtrapAddress, 0, len(values))
+	for _, value := range values {
+		parsed, err := mail.ParseAddress(value)
+		if err == nil {
+			addresses = append(addresses, mailtrapAddress{Email: parsed.Address, Name: parsed.Name})
+			continue
+		}
+		addresses = append(addresses, mailtrapAddress{Email: value})
+	}
+	return addresses
 }
 
 func sendMailImplicitTLS(host string, port int, auth smtp.Auth, from string, recipients []string, msg []byte) error {
@@ -819,13 +1100,6 @@ func (a *App) hashIP(ip string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-func successfulResponse(err error) sql.NullString {
-	if err != nil {
-		return sql.NullString{}
-	}
-	return sql.NullString{String: "accepted by smtp client", Valid: true}
-}
-
 func nullableString(value string) sql.NullString {
 	if value == "" {
 		return sql.NullString{}
@@ -862,42 +1136,72 @@ func splitCSV(value string) []string {
 	return out
 }
 
-func env(key, fallback string) string {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	return value
-}
-
-func envInt(key string, fallback int) int {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return fallback
-	}
-	return parsed
-}
-
-func envBool(key string, fallback bool) bool {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return fallback
-	}
-	return parsed
-}
-
 func randomToken(bytesLen int) (string, error) {
 	buf := make([]byte, bytesLen)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func setString(dst *string, value string) {
+	if strings.TrimSpace(value) != "" {
+		*dst = strings.TrimSpace(value)
+	}
+}
+
+func setStrings(dst *[]string, values []string) {
+	if len(values) > 0 {
+		*dst = values
+	}
+}
+
+func setInt(dst *int, value int) {
+	if value > 0 {
+		*dst = value
+	}
+}
+
+func setStringFromEnv(dst *string, key string) {
+	if value, ok := os.LookupEnv(key); ok {
+		*dst = strings.TrimSpace(value)
+	}
+}
+
+func setLowerStringFromEnv(dst *string, key string) {
+	if value, ok := os.LookupEnv(key); ok {
+		*dst = strings.ToLower(strings.TrimSpace(value))
+	}
+}
+
+func setCSVFromEnv(dst *[]string, key string) {
+	if value, ok := os.LookupEnv(key); ok {
+		*dst = splitCSV(value)
+	}
+}
+
+func setIntFromEnv(dst *int, key string) error {
+	value, ok := os.LookupEnv(key)
+	if !ok {
+		return nil
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return fmt.Errorf("%s must be an integer: %w", key, err)
+	}
+	*dst = parsed
+	return nil
+}
+
+func setBoolFromEnv(dst *bool, key string) error {
+	value, ok := os.LookupEnv(key)
+	if !ok {
+		return nil
+	}
+	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
+		return fmt.Errorf("%s must be a boolean: %w", key, err)
+	}
+	*dst = parsed
+	return nil
 }

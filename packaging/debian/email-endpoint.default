@@ -1,0 +1,3 @@
+EMAIL_ENDPOINT_ENABLED=false
+EMAIL_ENDPOINT_CONFIG=/etc/email-endpoint/config.yaml
+EMAIL_ENDPOINT_PIDFILE=/run/email-endpoint/email-endpoint.pid
