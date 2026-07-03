@@ -877,14 +877,18 @@ func (a *App) sendSMTP(j job) error {
 	msg.WriteString("\r\n")
 
 	auth := smtp.PlainAuth("", a.cfg.SMTPUsername, a.cfg.SMTPPassword, a.cfg.SMTPHost)
+	envelopeRecipients, err := envelopeAddresses(a.cfg.Recipients)
+	if err != nil {
+		return err
+	}
 	if a.cfg.SMTPPort == 465 {
-		return sendMailImplicitTLS(a.cfg.SMTPHost, a.cfg.SMTPPort, auth, fromAddr.Address, a.cfg.Recipients, msg.Bytes())
+		return sendMailImplicitTLS(a.cfg.SMTPHost, a.cfg.SMTPPort, auth, fromAddr.Address, envelopeRecipients, msg.Bytes())
 	}
 	if !a.cfg.SMTPInsecurePlain && a.cfg.SMTPPort == 25 {
 		return errors.New("plain SMTP auth on port 25 is disabled; set SMTP_INSECURE_PLAIN_AUTH=true to override")
 	}
 	addr := net.JoinHostPort(a.cfg.SMTPHost, strconv.Itoa(a.cfg.SMTPPort))
-	return smtp.SendMail(addr, auth, fromAddr.Address, a.cfg.Recipients, msg.Bytes())
+	return smtp.SendMail(addr, auth, fromAddr.Address, envelopeRecipients, msg.Bytes())
 }
 
 func (a *App) sendMailtrap(ctx context.Context, j job) (string, error) {
@@ -963,6 +967,18 @@ func addressesFromEmails(values []string) []mailtrapAddress {
 		addresses = append(addresses, mailtrapAddress{Email: value})
 	}
 	return addresses
+}
+
+func envelopeAddresses(values []string) ([]string, error) {
+	addresses := make([]string, 0, len(values))
+	for _, value := range values {
+		parsed, err := mail.ParseAddress(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid recipient %q: %w", value, err)
+		}
+		addresses = append(addresses, parsed.Address)
+	}
+	return addresses, nil
 }
 
 func sendMailImplicitTLS(host string, port int, auth smtp.Auth, from string, recipients []string, msg []byte) error {

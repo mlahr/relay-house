@@ -182,6 +182,25 @@ security:
 	}
 }
 
+func TestEnvelopeAddressesStripsDisplayNames(t *testing.T) {
+	got, err := envelopeAddresses([]string{
+		"Owner <owner@example.com>",
+		"audit@example.com",
+	})
+	if err != nil {
+		t.Fatalf("envelopeAddresses returned error: %v", err)
+	}
+	want := []string{"owner@example.com", "audit@example.com"}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func writeTestConfig(t *testing.T, path, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
