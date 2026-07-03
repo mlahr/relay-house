@@ -1,14 +1,187 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
+
+func TestHasHelpFlag(t *testing.T) {
+	for _, args := range [][]string{
+		{"-h"},
+		{"--help"},
+		{"--config", "config.yaml", "--help"},
+	} {
+		if !hasHelpFlag(args) {
+			t.Fatalf("hasHelpFlag(%v) = false, want true", args)
+		}
+	}
+	if hasHelpFlag([]string{"--config", "help.yaml"}) {
+		t.Fatal("hasHelpFlag returned true for non-help args")
+	}
+}
+
+func TestPrintUsage(t *testing.T) {
+	var buf bytes.Buffer
+	printUsage(&buf)
+	output := buf.String()
+	for _, want := range []string{
+		"relay-house ",
+		"Usage:",
+		"relay-house [options]",
+		"-h, --help",
+		"-config, --config PATH",
+		"events",
+		"Validation-required settings:",
+		"MAILTRAP_API_TOKEN",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("usage output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestEventDatabasePathPrecedence(t *testing.T) {
+	clearConfigEnv(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, configPath, `
+database:
+  path: yaml.db
+`)
+
+	got, err := eventDatabasePath("", "")
+	if err != nil {
+		t.Fatalf("eventDatabasePath default returned error: %v", err)
+	}
+	if got != "relay-house.db" {
+		t.Fatalf("default database path = %q", got)
+	}
+
+	got, err = eventDatabasePath(configPath, "")
+	if err != nil {
+		t.Fatalf("eventDatabasePath YAML returned error: %v", err)
+	}
+	if got != "yaml.db" {
+		t.Fatalf("YAML database path = %q", got)
+	}
+
+	t.Setenv("DATABASE_PATH", "env.db")
+	got, err = eventDatabasePath(configPath, "")
+	if err != nil {
+		t.Fatalf("eventDatabasePath env returned error: %v", err)
+	}
+	if got != "env.db" {
+		t.Fatalf("env database path = %q", got)
+	}
+
+	got, err = eventDatabasePath(configPath, "flag.db")
+	if err != nil {
+		t.Fatalf("eventDatabasePath override returned error: %v", err)
+	}
+	if got != "flag.db" {
+		t.Fatalf("override database path = %q", got)
+	}
+}
+
+func TestParseEventCommandOptions(t *testing.T) {
+	clearConfigEnv(t)
+	opts, err := parseEventCommandOptions([]string{"-database", "events.db", "-limit", "7", "--json"})
+	if err != nil {
+		t.Fatalf("parseEventCommandOptions returned error: %v", err)
+	}
+	if opts.DatabasePath != "events.db" || opts.Limit != 7 || !opts.JSON {
+		t.Fatalf("opts = %#v", opts)
+	}
+
+	if _, err := parseEventCommandOptions([]string{"-limit", "0"}); err == nil {
+		t.Fatal("parseEventCommandOptions accepted limit 0")
+	}
+	if _, err := parseEventCommandOptions([]string{"-limit", "501"}); err == nil {
+		t.Fatal("parseEventCommandOptions accepted limit 501")
+	}
+}
+
+func TestQueryEventsAndRenderersOmitMessageContent(t *testing.T) {
+	db := openSeededEventDB(t)
+	defer db.Close()
+
+	events, err := queryEvents(context.Background(), db, 4)
+	if err != nil {
+		t.Fatalf("queryEvents returned error: %v", err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("len(events) = %d, want 4", len(events))
+	}
+	wantEvents := []string{
+		"delivery.job.current",
+		"delivery.attempt.failed",
+		"delivery.attempt.sent",
+		"submission.accepted",
+	}
+	for i, want := range wantEvents {
+		if events[i].Event != want {
+			t.Fatalf("events[%d].Event = %q, want %q: %#v", i, events[i].Event, want, events)
+		}
+	}
+	if events[0].Status != "retry" || events[0].Attempt != 2 || events[0].Summary != "smtp temporary failure" {
+		t.Fatalf("current job event = %#v", events[0])
+	}
+
+	var table bytes.Buffer
+	if err := writeEventsTable(&table, events); err != nil {
+		t.Fatalf("writeEventsTable returned error: %v", err)
+	}
+	assertNoSensitiveEventOutput(t, table.String())
+	for _, want := range []string{"time", "delivery.attempt.failed", "submission.accepted", "smtp temporary failure"} {
+		if !strings.Contains(table.String(), want) {
+			t.Fatalf("table output missing %q:\n%s", want, table.String())
+		}
+	}
+
+	var jsonOut bytes.Buffer
+	if err := writeEventsJSON(&jsonOut, events); err != nil {
+		t.Fatalf("writeEventsJSON returned error: %v", err)
+	}
+	assertNoSensitiveEventOutput(t, jsonOut.String())
+	var decoded []eventRow
+	if err := json.Unmarshal(jsonOut.Bytes(), &decoded); err != nil {
+		t.Fatalf("event JSON did not decode: %v\n%s", err, jsonOut.String())
+	}
+	if len(decoded) != len(events) || decoded[0].Event != "delivery.job.current" {
+		t.Fatalf("decoded events = %#v", decoded)
+	}
+}
+
+func TestRunEventsCommandReadsDatabaseWithoutMutating(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "events.db")
+	db := openSeededEventDBAtPath(t, dbPath)
+	before := tableCounts(t, db)
+	db.Close()
+
+	var out bytes.Buffer
+	if err := runEventsCommand(&out, []string{"-database", dbPath, "-limit", "2"}); err != nil {
+		t.Fatalf("runEventsCommand returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), "delivery.job.current") {
+		t.Fatalf("events output missing current job event:\n%s", out.String())
+	}
+
+	db = openExistingEventDB(t, dbPath)
+	defer db.Close()
+	after := tableCounts(t, db)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("table counts changed: before=%#v after=%#v", before, after)
+	}
+}
 
 func TestSendMailtrap(t *testing.T) {
 	var gotAuth string
@@ -205,6 +378,115 @@ func writeTestConfig(t *testing.T, path, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+}
+
+func openSeededEventDB(t *testing.T) *sql.DB {
+	t.Helper()
+	return openSeededEventDBAtPath(t, filepath.Join(t.TempDir(), "events.db"))
+}
+
+func openSeededEventDBAtPath(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db := openExistingEventDB(t, path)
+	app := &App{
+		db:  db,
+		now: func() time.Time { return time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC) },
+	}
+	if err := app.migrate(context.Background()); err != nil {
+		t.Fatalf("migrate event db: %v", err)
+	}
+	seedEventRows(t, db)
+	return db
+}
+
+func openExistingEventDB(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	return db
+}
+
+func seedEventRows(t *testing.T, db *sql.DB) {
+	t.Helper()
+	execSQL(t, db, `
+		INSERT INTO projects (key, name, recipients_json, allowed_origins_json, created_at, updated_at)
+		VALUES ('project-a', 'main', '[]', '[]', '2026-07-03T11:59:00Z', '2026-07-03T11:59:00Z')
+	`)
+	execSQL(t, db, `
+		INSERT INTO submissions (
+			id, project_key, origin, ip_hash, user_agent,
+			name, email, subject, message, payload_json,
+			status, created_at, updated_at
+		) VALUES (
+			'submission-a', 'project-a', 'https://example.com', 'hash', 'agent',
+			'Private Person', 'private@example.com', 'Private Subject', 'Private Message Body',
+			'{"message":"Private Message Body"}',
+			'retry', '2026-07-03T12:00:00Z', '2026-07-03T12:03:00Z'
+		)
+	`)
+	execSQL(t, db, `
+		INSERT INTO delivery_jobs (
+			id, submission_id, status, attempt_count, next_attempt_at, last_error, created_at, updated_at
+		) VALUES (
+			'job-a', 'submission-a', 'retry', 2, '2026-07-03T12:10:00Z',
+			'smtp temporary failure', '2026-07-03T12:00:00Z', '2026-07-03T12:03:00Z'
+		)
+	`)
+	execSQL(t, db, `
+		INSERT INTO delivery_attempts (
+			id, job_id, submission_id, attempt_number, status, provider,
+			response, error, duration_ms, created_at
+		) VALUES (
+			'attempt-1', 'job-a', 'submission-a', 1, 'sent', 'smtp',
+			'accepted by smtp client', NULL, 25, '2026-07-03T12:01:00Z'
+		)
+	`)
+	execSQL(t, db, `
+		INSERT INTO delivery_attempts (
+			id, job_id, submission_id, attempt_number, status, provider,
+			response, error, duration_ms, created_at
+		) VALUES (
+			'attempt-2', 'job-a', 'submission-a', 2, 'failed', 'smtp',
+			NULL, 'smtp temporary failure', 30, '2026-07-03T12:02:00Z'
+		)
+	`)
+}
+
+func execSQL(t *testing.T, db *sql.DB, query string) {
+	t.Helper()
+	if _, err := db.Exec(query); err != nil {
+		t.Fatalf("exec SQL failed: %v\n%s", err, query)
+	}
+}
+
+func tableCounts(t *testing.T, db *sql.DB) map[string]int {
+	t.Helper()
+	counts := make(map[string]int)
+	for _, table := range []string{"projects", "submissions", "delivery_jobs", "delivery_attempts", "rate_limits"} {
+		var count int
+		if err := db.QueryRow("SELECT count(*) FROM " + table).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		counts[table] = count
+	}
+	return counts
+}
+
+func assertNoSensitiveEventOutput(t *testing.T, output string) {
+	t.Helper()
+	for _, disallowed := range []string{
+		"Private Person",
+		"private@example.com",
+		"Private Subject",
+		"Private Message Body",
+	} {
+		if strings.Contains(output, disallowed) {
+			t.Fatalf("event output leaked %q:\n%s", disallowed, output)
+		}
 	}
 }
 

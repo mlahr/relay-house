@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -107,6 +108,25 @@ type mailtrapAddress struct {
 	Name  string `json:"name,omitempty"`
 }
 
+type eventCommandOptions struct {
+	ConfigPath   string
+	DatabasePath string
+	Limit        int
+	JSON         bool
+}
+
+type eventRow struct {
+	Time         string `json:"time"`
+	Event        string `json:"event"`
+	Status       string `json:"status"`
+	Provider     string `json:"provider,omitempty"`
+	SubmissionID string `json:"submission_id,omitempty"`
+	JobID        string `json:"job_id,omitempty"`
+	Attempt      int    `json:"attempt,omitempty"`
+	Project      string `json:"project,omitempty"`
+	Summary      string `json:"summary,omitempty"`
+}
+
 type fileConfig struct {
 	HTTP struct {
 		Address string `yaml:"address"`
@@ -156,8 +176,25 @@ type fileConfig struct {
 }
 
 func main() {
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "events" {
+		if err := runEventsCommand(os.Stdout, args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "relay-house events: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		fmt.Fprintf(os.Stderr, "relay-house: unknown command %q\nRun 'relay-house --help' for usage.\n", args[0])
+		os.Exit(1)
+	}
+	if hasHelpFlag(args) {
+		printUsage(os.Stdout)
+		return
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	cfg, err := loadConfigFromArgs(os.Args[1:])
+	cfg, err := loadConfigFromArgs(args)
 	if err != nil {
 		logger.Error("config.invalid", "error", err)
 		os.Exit(1)
@@ -227,6 +264,255 @@ func main() {
 
 func loadConfig() (Config, error) {
 	return loadConfigFromArgs(nil)
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+	}
+	return false
+}
+
+func printUsage(w io.Writer) {
+	_, _ = fmt.Fprintf(w, `relay-house %s
+
+Usage:
+  relay-house [options]
+  relay-house events [options]
+
+Commands:
+  events                  Print recent database events and exit.
+
+Options:
+  -config, --config PATH   Path to YAML config file.
+  -h, --help              Print this help text.
+  -version, --version     Print version.
+
+Configuration:
+  Values are loaded in this order:
+    compiled defaults < YAML config from -config < environment variables
+
+  Validation-required settings:
+    ALLOWED_ORIGINS
+    RECIPIENTS
+    MAIL_FROM
+
+  Recommended persistent settings:
+    PROJECT_KEY
+    IP_HASH_SECRET
+
+  SMTP delivery also requires:
+    SMTP_HOST
+    SMTP_USERNAME
+    SMTP_PASSWORD
+
+  Mailtrap delivery also requires:
+    DELIVERY_PROVIDER=mailtrap
+    MAILTRAP_API_TOKEN
+
+Examples:
+  relay-house -config /etc/relay-house/config.yaml
+  relay-house events -config /etc/relay-house/config.yaml -limit 50
+  relay-house -version
+`, version)
+}
+
+func printEventsUsage(w io.Writer) {
+	_, _ = fmt.Fprint(w, `Usage:
+  relay-house events [options]
+
+Options:
+  -config, --config PATH     Path to YAML config file.
+  -database, --database PATH SQLite database path override.
+  -limit N                  Maximum events to print. Default 25, maximum 500.
+  --json                    Print a JSON array instead of a table.
+  -h, --help                Print this help text.
+`)
+}
+
+func runEventsCommand(w io.Writer, args []string) error {
+	if hasHelpFlag(args) {
+		printEventsUsage(w)
+		return nil
+	}
+	opts, err := parseEventCommandOptions(args)
+	if err != nil {
+		return err
+	}
+	events, err := loadEvents(opts)
+	if err != nil {
+		return err
+	}
+	if opts.JSON {
+		return writeEventsJSON(w, events)
+	}
+	return writeEventsTable(w, events)
+}
+
+func parseEventCommandOptions(args []string) (eventCommandOptions, error) {
+	opts := eventCommandOptions{Limit: 25}
+	fs := flag.NewFlagSet("relay-house events", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&opts.ConfigPath, "config", "", "path to YAML config file")
+	fs.StringVar(&opts.DatabasePath, "database", "", "SQLite database path override")
+	fs.IntVar(&opts.Limit, "limit", opts.Limit, "maximum events to print")
+	fs.BoolVar(&opts.JSON, "json", false, "print JSON")
+	if err := fs.Parse(args); err != nil {
+		return eventCommandOptions{}, err
+	}
+	if fs.NArg() > 0 {
+		return eventCommandOptions{}, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	if opts.Limit < 1 {
+		return eventCommandOptions{}, errors.New("-limit must be at least 1")
+	}
+	if opts.Limit > 500 {
+		return eventCommandOptions{}, errors.New("-limit must be at most 500")
+	}
+	databasePath, err := eventDatabasePath(opts.ConfigPath, opts.DatabasePath)
+	if err != nil {
+		return eventCommandOptions{}, err
+	}
+	opts.DatabasePath = databasePath
+	return opts, nil
+}
+
+func eventDatabasePath(configPath, databaseOverride string) (string, error) {
+	cfg := defaultConfig()
+	if configPath != "" {
+		if err := applyYAMLConfig(&cfg, configPath); err != nil {
+			return "", err
+		}
+	}
+	setStringFromEnv(&cfg.DatabasePath, "DATABASE_PATH")
+	setString(&cfg.DatabasePath, databaseOverride)
+	return cfg.DatabasePath, nil
+}
+
+func loadEvents(opts eventCommandOptions) ([]eventRow, error) {
+	db, err := sql.Open("sqlite", readOnlySQLiteDSN(opts.DatabasePath))
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	return queryEvents(context.Background(), db, opts.Limit)
+}
+
+func readOnlySQLiteDSN(path string) string {
+	u := url.URL{Scheme: "file", Path: path}
+	q := u.Query()
+	q.Set("mode", "ro")
+	q.Set("_pragma", "busy_timeout(5000)")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func queryEvents(ctx context.Context, db *sql.DB, limit int) ([]eventRow, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT event_time, event, status, provider, submission_id, job_id, attempt, project, summary
+		FROM (
+			SELECT
+				s.created_at AS event_time,
+				'submission.accepted' AS event,
+				s.status AS status,
+				'' AS provider,
+				s.id AS submission_id,
+				'' AS job_id,
+				0 AS attempt,
+				s.project_key AS project,
+				'origin=' || s.origin AS summary
+			FROM submissions s
+			UNION ALL
+			SELECT
+				a.created_at AS event_time,
+				CASE
+					WHEN a.status = 'sent' THEN 'delivery.attempt.sent'
+					ELSE 'delivery.attempt.failed'
+				END AS event,
+				a.status AS status,
+				a.provider AS provider,
+				a.submission_id AS submission_id,
+				a.job_id AS job_id,
+				a.attempt_number AS attempt,
+				s.project_key AS project,
+				COALESCE(a.error, '')
+			FROM delivery_attempts a
+			JOIN submissions s ON s.id = a.submission_id
+			UNION ALL
+			SELECT
+				j.updated_at AS event_time,
+				'delivery.job.current' AS event,
+				j.status AS status,
+				'' AS provider,
+				j.submission_id AS submission_id,
+				j.id AS job_id,
+				j.attempt_count AS attempt,
+				s.project_key AS project,
+				CASE
+					WHEN j.last_error IS NOT NULL AND j.last_error != '' THEN j.last_error
+					WHEN j.status = 'retry' THEN 'next_attempt_at=' || j.next_attempt_at
+					ELSE ''
+				END AS summary
+			FROM delivery_jobs j
+			JOIN submissions s ON s.id = j.submission_id
+			WHERE j.status IN ('queued', 'retry', 'sending', 'dead')
+		)
+		ORDER BY event_time DESC, event DESC, submission_id DESC, job_id DESC, attempt DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	events := make([]eventRow, 0, limit)
+	for rows.Next() {
+		var event eventRow
+		if err := rows.Scan(&event.Time, &event.Event, &event.Status, &event.Provider, &event.SubmissionID, &event.JobID, &event.Attempt, &event.Project, &event.Summary); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func writeEventsJSON(w io.Writer, events []eventRow) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(events)
+}
+
+func writeEventsTable(w io.Writer, events []eventRow) error {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(tw, "time\tevent\tstatus\tprovider\tsubmission_id\tjob_id\tattempt\tproject\tsummary"); err != nil {
+		return err
+	}
+	for _, event := range events {
+		attempt := ""
+		if event.Attempt > 0 {
+			attempt = strconv.Itoa(event.Attempt)
+		}
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			event.Time,
+			event.Event,
+			event.Status,
+			event.Provider,
+			event.SubmissionID,
+			event.JobID,
+			attempt,
+			event.Project,
+			event.Summary,
+		); err != nil {
+			return err
+		}
+	}
+	return tw.Flush()
 }
 
 func loadConfigFromArgs(args []string) (Config, error) {
