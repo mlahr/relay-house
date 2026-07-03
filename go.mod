@@ -1,4 +1,4 @@
-module email-endpoint
+module relay-house
 
 go 1.24
 

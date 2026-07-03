@@ -1,0 +1,28 @@
+[Unit]
+Description=RelayHouse self-hosted website email relay
+Documentation=https://github.com/mlahr/relay-house
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/relay-house
+ExecStart=/bin/sh -c 'if [ "$RELAY_HOUSE_ENABLED" != "true" ]; then echo "relay-house is disabled in /etc/default/relay-house"; exit 0; fi; exec /usr/bin/relay-house --config "$RELAY_HOUSE_CONFIG"'
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+User=relay-house
+Group=relay-house
+StateDirectory=relay-house
+RuntimeDirectory=relay-house
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/relay-house /run/relay-house
+SyslogIdentifier=relay-house
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

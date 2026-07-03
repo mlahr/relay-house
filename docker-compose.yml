@@ -1,5 +1,5 @@
 services:
-  email-endpoint:
+  relay-house:
     build: .
     env_file:
       - .env
@@ -8,7 +8,7 @@ services:
     volumes:
       - email-data:/app/data
     environment:
-      DATABASE_PATH: /app/data/email-endpoint.db
+      DATABASE_PATH: /app/data/relay-house.db
     restart: unless-stopped
 
 volumes:

@@ -7,9 +7,9 @@ fi
 
 if [ "$1" = "purge" ]; then
 	if command -v update-rc.d >/dev/null 2>&1; then
-		update-rc.d email-endpoint remove >/dev/null 2>&1 || true
+		update-rc.d relay-house remove >/dev/null 2>&1 || true
 	fi
-	rm -rf /var/lib/email-endpoint /run/email-endpoint
+	rm -rf /var/lib/relay-house /run/relay-house
 fi
 
 exit 0

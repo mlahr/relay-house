@@ -1,0 +1,3 @@
+RELAY_HOUSE_ENABLED=false
+RELAY_HOUSE_CONFIG=/etc/relay-house/config.yaml
+RELAY_HOUSE_PIDFILE=/run/relay-house/relay-house.pid

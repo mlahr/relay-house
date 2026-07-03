@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly REPO_OWNER="mlahr"
-readonly REPO_NAME="email-endpoint"
+readonly REPO_NAME="relay-house"
 readonly RELEASE_BASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download"
 readonly INSTALLER_VERSION="2026-07-02.1"
 
@@ -19,7 +19,7 @@ if [ "$(uname -s)" != "Linux" ]; then
 	die "unsupported operating system: $(uname -s); this installer supports Debian-based Linux only"
 fi
 
-printf 'email-endpoint installer %s\n' "$INSTALLER_VERSION"
+printf 'RelayHouse installer %s\n' "$INSTALLER_VERSION"
 
 need_command curl
 need_command dpkg
@@ -32,7 +32,7 @@ case "$arch" in
 		asset_arch="amd64"
 		;;
 	*)
-		die "unsupported Debian architecture: $arch; current email-endpoint releases publish linux amd64 .deb assets only"
+		die "unsupported Debian architecture: $arch; current RelayHouse releases publish linux amd64 .deb assets only"
 		;;
 esac
 
@@ -54,7 +54,7 @@ checksums_file="$tmp_dir/checksums.txt"
 curl -fsSL "$RELEASE_BASE_URL/checksums.txt" -o "$checksums_file"
 
 asset_name="$(
-	awk -v pattern="email-endpoint_.*_linux_${asset_arch}[.]deb$" '$2 ~ pattern { print $2 }' "$checksums_file"
+	awk -v pattern="relay-house_.*_linux_${asset_arch}[.]deb$" '$2 ~ pattern { print $2 }' "$checksums_file"
 )"
 
 if [ -z "$asset_name" ]; then

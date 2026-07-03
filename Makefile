@@ -1,4 +1,4 @@
-APP_NAME := email-endpoint
+APP_NAME := relay-house
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 

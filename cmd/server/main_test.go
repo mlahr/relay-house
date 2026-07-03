@@ -93,7 +93,7 @@ func TestLoadConfigFromYAML(t *testing.T) {
 http:
   address: 127.0.0.1:18080
 database:
-  path: /var/lib/email-endpoint/email-endpoint.db
+  path: /var/lib/relay-house/relay-house.db
 project:
   key: yaml-project
   name: yaml-site
@@ -128,7 +128,7 @@ security:
 	if cfg.Addr != "127.0.0.1:18080" {
 		t.Fatalf("Addr = %q", cfg.Addr)
 	}
-	if cfg.DatabasePath != "/var/lib/email-endpoint/email-endpoint.db" {
+	if cfg.DatabasePath != "/var/lib/relay-house/relay-house.db" {
 		t.Fatalf("DatabasePath = %q", cfg.DatabasePath)
 	}
 	if cfg.ProjectKey != "yaml-project" || cfg.ProjectName != "yaml-site" {

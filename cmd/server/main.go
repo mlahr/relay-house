@@ -230,7 +230,7 @@ func loadConfig() (Config, error) {
 }
 
 func loadConfigFromArgs(args []string) (Config, error) {
-	fs := flag.NewFlagSet("email-endpoint", flag.ContinueOnError)
+	fs := flag.NewFlagSet("relay-house", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", "", "path to YAML config file")
 	showVersion := fs.Bool("version", false, "print version")
@@ -238,7 +238,7 @@ func loadConfigFromArgs(args []string) (Config, error) {
 		return Config{}, err
 	}
 	if *showVersion {
-		fmt.Printf("email-endpoint %s\n", version)
+		fmt.Printf("relay-house %s\n", version)
 		os.Exit(0)
 	}
 
@@ -257,7 +257,7 @@ func loadConfigFromArgs(args []string) (Config, error) {
 func defaultConfig() Config {
 	return Config{
 		Addr:             ":8080",
-		DatabasePath:     "email-endpoint.db",
+		DatabasePath:     "relay-house.db",
 		DeliveryProvider: "smtp",
 		ProjectName:      "default",
 		SMTPPort:         587,

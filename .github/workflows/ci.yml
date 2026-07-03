@@ -30,4 +30,4 @@ jobs:
         run: go test ./...
 
       - name: Build
-        run: go build -o email-endpoint ./cmd/server
+        run: go build -o relay-house ./cmd/server

@@ -1,0 +1,74 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          relay-house
+# Required-Start:    $remote_fs $network
+# Required-Stop:     $remote_fs $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: RelayHouse website email relay
+# Description:       Starts the RelayHouse website email relay daemon.
+### END INIT INFO
+
+set -e
+
+NAME=relay-house
+DESC="RelayHouse website email relay"
+DAEMON=/usr/bin/relay-house
+DEFAULTS=/etc/default/relay-house
+USER=relay-house
+GROUP=relay-house
+
+RELAY_HOUSE_ENABLED=false
+RELAY_HOUSE_CONFIG=/etc/relay-house/config.yaml
+RELAY_HOUSE_PIDFILE=/run/relay-house/relay-house.pid
+
+[ -r "$DEFAULTS" ] && . "$DEFAULTS"
+
+. /lib/lsb/init-functions
+
+ensure_runtime_dir() {
+	install -d -o "$USER" -g "$GROUP" -m 0755 /run/relay-house
+}
+
+case "$1" in
+	start)
+		if [ "$RELAY_HOUSE_ENABLED" != "true" ]; then
+			log_warning_msg "$DESC is disabled in $DEFAULTS"
+			exit 0
+		fi
+		ensure_runtime_dir
+		log_daemon_msg "Starting $DESC" "$NAME"
+		if start-stop-daemon --start --quiet --background --make-pidfile --pidfile "$RELAY_HOUSE_PIDFILE" --chuid "$USER:$GROUP" --exec "$DAEMON" -- \
+			--config "$RELAY_HOUSE_CONFIG"; then
+			log_end_msg 0
+		else
+			log_end_msg 1
+		fi
+		;;
+	stop)
+		log_daemon_msg "Stopping $DESC" "$NAME"
+		if start-stop-daemon --stop --quiet --pidfile "$RELAY_HOUSE_PIDFILE" --retry TERM/30/KILL/5; then
+			rm -f "$RELAY_HOUSE_PIDFILE"
+			log_end_msg 0
+		else
+			log_end_msg 1
+		fi
+		;;
+	reload|force-reload)
+		log_warning_msg "$DESC does not support reload; use restart"
+		exit 3
+		;;
+	restart)
+		"$0" stop || true
+		"$0" start
+		;;
+	status)
+		status_of_proc -p "$RELAY_HOUSE_PIDFILE" "$DAEMON" "$NAME"
+		;;
+	*)
+		echo "Usage: /etc/init.d/$NAME {start|stop|reload|force-reload|restart|status}" >&2
+		exit 2
+		;;
+esac
+
+exit 0

@@ -1,6 +1,6 @@
-# email-endpoint
+# RelayHouse
 
-Self-hosted email endpoint for browser-based website forms.
+Self-hosted email relay for browser-based website forms.
 
 ## What It Does
 
@@ -31,7 +31,7 @@ go run ./cmd/server
 YAML config mode:
 
 ```sh
-go run ./cmd/server --config packaging/debian/email-endpoint.config.yaml
+go run ./cmd/server --config packaging/debian/relay-house.config.yaml
 ```
 
 The Go binary loads config in this order:
@@ -106,7 +106,7 @@ For Mailtrap Sandbox, set `MAILTRAP_API_URL` to the sandbox send endpoint for yo
 Install the latest GitHub release package:
 
 ```sh
-curl -fsSL https://github.com/mlahr/email-endpoint/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/mlahr/relay-house/releases/latest/download/install.sh | bash
 ```
 
 Or install from a checked-out repo after building a release `.deb`.
@@ -114,31 +114,31 @@ Or install from a checked-out repo after building a release `.deb`.
 Package paths:
 
 ```txt
-/usr/bin/email-endpoint
-/etc/email-endpoint/config.yaml
-/etc/default/email-endpoint
-/var/lib/email-endpoint/email-endpoint.db
+/usr/bin/relay-house
+/etc/relay-house/config.yaml
+/etc/default/relay-house
+/var/lib/relay-house/relay-house.db
 ```
 
 The package enables the service but keeps it disabled until configured. Edit:
 
 ```sh
-sudoedit /etc/email-endpoint/config.yaml
-sudoedit /etc/default/email-endpoint
+sudoedit /etc/relay-house/config.yaml
+sudoedit /etc/default/relay-house
 ```
 
 Set:
 
 ```sh
-EMAIL_ENDPOINT_ENABLED=true
+RELAY_HOUSE_ENABLED=true
 ```
 
 Then start it:
 
 ```sh
-sudo systemctl restart email-endpoint
-sudo systemctl status email-endpoint
-journalctl -u email-endpoint -f
+sudo systemctl restart relay-house
+sudo systemctl status relay-house
+journalctl -u relay-house -f
 ```
 
 ## Release
