@@ -4,17 +4,17 @@ http:
 database:
   path: /var/lib/relay-house/relay-house.db
 
-project:
-  key: replace-with-public-project-key
-  name: main
-  allowed_origins:
-    - https://example.com
-    - https://www.example.com
-  recipients:
-    - you@example.com
+projects:
+  - key: replace-with-public-project-key
+    name: main
+    from: Website Contact <contact@example.com>
+    allowed_origins:
+      - https://example.com
+      - https://www.example.com
+    recipients:
+      - you@example.com
 
 mail:
-  from: Website Contact <contact@example.com>
   delivery_provider: smtp
 
   smtp:

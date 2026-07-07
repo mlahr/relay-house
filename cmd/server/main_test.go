@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -222,8 +224,6 @@ func TestSendMailtrap(t *testing.T) {
 
 	app := &App{
 		cfg: Config{
-			From:             "Website Contact <contact@example.com>",
-			Recipients:       []string{"Owner <owner@example.com>"},
 			MailtrapAPIURL:   server.URL,
 			MailtrapAPIToken: "secret-token",
 			MailtrapBCC:      []string{"Audit <audit@example.com>"},
@@ -231,10 +231,12 @@ func TestSendMailtrap(t *testing.T) {
 	}
 
 	response, err := app.sendMailtrap(context.Background(), job{
-		Name:    "Jane Doe",
-		Email:   "jane@example.net",
-		Subject: "Subject",
-		Message: "Message body",
+		From:       "Website Contact <contact@example.com>",
+		Recipients: []string{"Owner <owner@example.com>"},
+		Name:       "Jane Doe",
+		Email:      "jane@example.net",
+		Subject:    "Subject",
+		Message:    "Message body",
 	})
 	if err != nil {
 		t.Fatalf("sendMailtrap returned error: %v", err)
@@ -261,15 +263,27 @@ func TestSendMailtrap(t *testing.T) {
 
 func TestLoadConfigMailtrapDoesNotRequireSMTP(t *testing.T) {
 	clearConfigEnv(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, configPath, `
+projects:
+  - key: test-project
+    name: test
+    from: Website Contact <contact@example.com>
+    allowed_origins:
+      - https://example.com
+    recipients:
+      - owner@example.com
+mail:
+  delivery_provider: mailtrap
+  mailtrap:
+    api_token: yaml-token
+security:
+  ip_hash_secret: secret
+`)
 	t.Setenv("DELIVERY_PROVIDER", "mailtrap")
-	t.Setenv("PROJECT_KEY", "test-project")
-	t.Setenv("ALLOWED_ORIGINS", "https://example.com")
-	t.Setenv("RECIPIENTS", "owner@example.com")
-	t.Setenv("MAIL_FROM", "Website Contact <contact@example.com>")
 	t.Setenv("MAILTRAP_API_TOKEN", "secret-token")
-	t.Setenv("IP_HASH_SECRET", "secret")
 
-	cfg, err := loadConfig()
+	cfg, err := loadConfigFromArgs([]string{"--config", configPath})
 	if err != nil {
 		t.Fatalf("loadConfig returned error: %v", err)
 	}
@@ -286,15 +300,22 @@ http:
   address: 127.0.0.1:18080
 database:
   path: /var/lib/relay-house/relay-house.db
-project:
-  key: yaml-project
-  name: yaml-site
-  allowed_origins:
-    - https://example.com
-  recipients:
-    - Owner <owner@example.com>
+projects:
+  - key: yaml-project
+    name: yaml-site
+    from: Website Contact <contact@example.com>
+    allowed_origins:
+      - https://example.com
+    recipients:
+      - Owner <owner@example.com>
+  - key: second-project
+    name: second-site
+    from: Second Contact <second@example.com>
+    allowed_origins:
+      - https://second.example.com
+    recipients:
+      - Second Owner <owner2@example.com>
 mail:
-  from: Website Contact <contact@example.com>
   delivery_provider: mailtrap
   mailtrap:
     api_url: https://send.api.mailtrap.io/api/send
@@ -323,8 +344,11 @@ security:
 	if cfg.DatabasePath != "/var/lib/relay-house/relay-house.db" {
 		t.Fatalf("DatabasePath = %q", cfg.DatabasePath)
 	}
-	if cfg.ProjectKey != "yaml-project" || cfg.ProjectName != "yaml-site" {
-		t.Fatalf("project = %q/%q", cfg.ProjectKey, cfg.ProjectName)
+	if len(cfg.Projects) != 2 {
+		t.Fatalf("len(Projects) = %d", len(cfg.Projects))
+	}
+	if cfg.Projects[0].Key != "yaml-project" || cfg.Projects[0].Name != "yaml-site" || cfg.Projects[0].From != "Website Contact <contact@example.com>" {
+		t.Fatalf("project[0] = %#v", cfg.Projects[0])
 	}
 	if cfg.DeliveryProvider != "mailtrap" || cfg.MailtrapAPIToken != "yaml-token" {
 		t.Fatalf("mailtrap config = %#v", cfg)
@@ -340,8 +364,8 @@ func TestConfigExampleYAMLLoads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfigFromArgs returned error for config.example.yaml: %v", err)
 	}
-	if cfg.ProjectKey != "replace-with-public-project-key" {
-		t.Fatalf("ProjectKey = %q", cfg.ProjectKey)
+	if len(cfg.Projects) != 1 || cfg.Projects[0].Key != "replace-with-public-project-key" {
+		t.Fatalf("Projects = %#v", cfg.Projects)
 	}
 	if cfg.DatabasePath != "relay-house.db" {
 		t.Fatalf("DatabasePath = %q", cfg.DatabasePath)
@@ -359,14 +383,14 @@ http:
   address: 127.0.0.1:18080
 database:
   path: yaml.db
-project:
-  key: yaml-project
-  allowed_origins:
-    - https://example.com
-  recipients:
-    - owner@example.com
+projects:
+  - key: yaml-project
+    from: Website Contact <contact@example.com>
+    allowed_origins:
+      - https://example.com
+    recipients:
+      - owner@example.com
 mail:
-  from: Website Contact <contact@example.com>
   delivery_provider: mailtrap
   mailtrap:
     api_token: yaml-token
@@ -388,6 +412,245 @@ security:
 	}
 	if cfg.DeliveryProvider != "smtp" || cfg.SMTPHost != "smtp.example.com" {
 		t.Fatalf("provider config = %#v", cfg)
+	}
+}
+
+func TestLoadConfigRejectsMissingProjectFrom(t *testing.T) {
+	clearConfigEnv(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, configPath, `
+projects:
+  - key: yaml-project
+    allowed_origins:
+      - https://example.com
+    recipients:
+      - owner@example.com
+mail:
+  delivery_provider: mailtrap
+  mailtrap:
+    api_token: yaml-token
+security:
+  ip_hash_secret: yaml-secret
+`)
+	_, err := loadConfigFromArgs([]string{"--config", configPath})
+	if err == nil || !strings.Contains(err.Error(), "projects[0].from is required") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadConfigRejectsDuplicateProjectKeys(t *testing.T) {
+	clearConfigEnv(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, configPath, `
+projects:
+  - key: duplicate
+    from: First <first@example.com>
+    allowed_origins:
+      - https://example.com
+    recipients:
+      - owner@example.com
+  - key: duplicate
+    from: Second <second@example.com>
+    allowed_origins:
+      - https://second.example.com
+    recipients:
+      - owner2@example.com
+mail:
+  delivery_provider: mailtrap
+  mailtrap:
+    api_token: yaml-token
+security:
+  ip_hash_secret: yaml-secret
+`)
+	_, err := loadConfigFromArgs([]string{"--config", configPath})
+	if err == nil || !strings.Contains(err.Error(), `duplicate project key "duplicate"`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestProjectEnvVarsDoNotConfigureProjects(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("PROJECT_KEY", "test-project")
+	t.Setenv("ALLOWED_ORIGINS", "https://example.com")
+	t.Setenv("RECIPIENTS", "owner@example.com")
+	t.Setenv("MAIL_FROM", "Website Contact <contact@example.com>")
+	t.Setenv("DELIVERY_PROVIDER", "mailtrap")
+	t.Setenv("MAILTRAP_API_TOKEN", "secret-token")
+	t.Setenv("IP_HASH_SECRET", "secret")
+
+	_, err := loadConfig()
+	if err == nil || !strings.Contains(err.Error(), "at least one project is required") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSendUsesPerProjectOriginPolicy(t *testing.T) {
+	app, closeApp := newTestApp(t, []ProjectConfig{
+		{
+			Key:            "project-a",
+			Name:           "Project A",
+			From:           "Project A <a@example.com>",
+			AllowedOrigins: []string{"https://a.example.com"},
+			Recipients:     []string{"Owner A <owner-a@example.com>"},
+		},
+		{
+			Key:            "project-b",
+			Name:           "Project B",
+			From:           "Project B <b@example.com>",
+			AllowedOrigins: []string{"https://b.example.com"},
+			Recipients:     []string{"Owner B <owner-b@example.com>"},
+		},
+	})
+	defer closeApp()
+
+	body := `{"project":"project-a","name":"Jane Doe","email":"jane@example.net","subject":"Hello","message":"Message"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/send", strings.NewReader(body))
+	req.Header.Set("Origin", "https://a.example.com")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://a.example.com" {
+		t.Fatalf("Access-Control-Allow-Origin = %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/send", strings.NewReader(body))
+	req.Header.Set("Origin", "https://b.example.com")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "origin not allowed") {
+		t.Fatalf("status/body = %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/send", strings.NewReader(strings.Replace(body, "project-a", "unknown-project", 1)))
+	req.Header.Set("Origin", "https://a.example.com")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "unknown project") {
+		t.Fatalf("status/body = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOptionsAllowsOriginFromAnyProject(t *testing.T) {
+	app, closeApp := newTestApp(t, []ProjectConfig{
+		{
+			Key:            "project-a",
+			Name:           "Project A",
+			From:           "Project A <a@example.com>",
+			AllowedOrigins: []string{"https://a.example.com"},
+			Recipients:     []string{"Owner A <owner-a@example.com>"},
+		},
+		{
+			Key:            "project-b",
+			Name:           "Project B",
+			From:           "Project B <b@example.com>",
+			AllowedOrigins: []string{"https://b.example.com"},
+			Recipients:     []string{"Owner B <owner-b@example.com>"},
+		},
+	})
+	defer closeApp()
+
+	req := httptest.NewRequest(http.MethodOptions, "/v1/send", nil)
+	req.Header.Set("Origin", "https://b.example.com")
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://b.example.com" {
+		t.Fatalf("Access-Control-Allow-Origin = %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestMigrateAddsProjectFromAddressColumn(t *testing.T) {
+	db := openExistingEventDB(t, filepath.Join(t.TempDir(), "old.db"))
+	defer db.Close()
+	execSQL(t, db, `
+		CREATE TABLE projects (
+			key TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			recipients_json TEXT NOT NULL,
+			allowed_origins_json TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)
+	`)
+	execSQL(t, db, `
+		INSERT INTO projects (key, name, recipients_json, allowed_origins_json, created_at, updated_at)
+		VALUES ('project-a', 'old name', '[]', '[]', '2026-07-03T11:59:00Z', '2026-07-03T11:59:00Z')
+	`)
+	app := &App{
+		cfg: Config{
+			Projects: []ProjectConfig{
+				{
+					Key:            "project-a",
+					Name:           "Project A",
+					From:           "Project A <a@example.com>",
+					AllowedOrigins: []string{"https://a.example.com"},
+					Recipients:     []string{"Owner A <owner-a@example.com>"},
+				},
+			},
+		},
+		db:  db,
+		now: func() time.Time { return time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC) },
+	}
+	if err := app.migrate(context.Background()); err != nil {
+		t.Fatalf("migrate returned error: %v", err)
+	}
+	if err := app.seedProjects(context.Background()); err != nil {
+		t.Fatalf("seedProjects returned error: %v", err)
+	}
+	var from string
+	if err := db.QueryRow(`SELECT from_address FROM projects WHERE key = 'project-a'`).Scan(&from); err != nil {
+		t.Fatalf("select from_address: %v", err)
+	}
+	if from != "Project A <a@example.com>" {
+		t.Fatalf("from_address = %q", from)
+	}
+}
+
+func TestSeedProjectsRejectsStoredProjectWithoutFromAddress(t *testing.T) {
+	db := openExistingEventDB(t, filepath.Join(t.TempDir(), "old.db"))
+	defer db.Close()
+	execSQL(t, db, `
+		CREATE TABLE projects (
+			key TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			recipients_json TEXT NOT NULL,
+			allowed_origins_json TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)
+	`)
+	execSQL(t, db, `
+		INSERT INTO projects (key, name, recipients_json, allowed_origins_json, created_at, updated_at)
+		VALUES ('old-project', 'old name', '[]', '[]', '2026-07-03T11:59:00Z', '2026-07-03T11:59:00Z')
+	`)
+	app := &App{
+		cfg: Config{
+			Projects: []ProjectConfig{
+				{
+					Key:            "new-project",
+					Name:           "Project A",
+					From:           "Project A <a@example.com>",
+					AllowedOrigins: []string{"https://a.example.com"},
+					Recipients:     []string{"Owner A <owner-a@example.com>"},
+				},
+			},
+		},
+		db:  db,
+		now: func() time.Time { return time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC) },
+	}
+	if err := app.migrate(context.Background()); err != nil {
+		t.Fatalf("migrate returned error: %v", err)
+	}
+	err := app.seedProjects(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "stored projects missing from_address after migration: old-project") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -434,6 +697,43 @@ func openSeededEventDBAtPath(t *testing.T, path string) *sql.DB {
 	}
 	seedEventRows(t, db)
 	return db
+}
+
+func newTestApp(t *testing.T, projects []ProjectConfig) (*App, func()) {
+	t.Helper()
+	raw := defaultConfig()
+	raw.Projects = projects
+	raw.DeliveryProvider = "mailtrap"
+	raw.MailtrapAPIToken = "secret-token"
+	raw.RateMinute = 100
+	raw.RateDay = 100
+	raw.MaxRetries = 5
+	raw.IPHashSecret = "hash-secret"
+	cfg, err := validateConfig(raw)
+	if err != nil {
+		t.Fatalf("validate config: %v", err)
+	}
+	db := openExistingEventDB(t, filepath.Join(t.TempDir(), "relay-house.db"))
+	app := &App{
+		cfg:        cfg,
+		db:         db,
+		log:        nilLogger(),
+		projectMap: makeProjectMap(cfg.Projects),
+		now:        func() time.Time { return time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC) },
+	}
+	if err := app.migrate(context.Background()); err != nil {
+		db.Close()
+		t.Fatalf("migrate test app: %v", err)
+	}
+	if err := app.seedProjects(context.Background()); err != nil {
+		db.Close()
+		t.Fatalf("seed test app: %v", err)
+	}
+	return app, func() { _ = db.Close() }
+}
+
+func nilLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func openExistingEventDB(t *testing.T, path string) *sql.DB {

@@ -15,26 +15,26 @@ database:
   # /var/lib/relay-house/relay-house.db
   path: relay-house.db
 
-project:
-  # Public project identifier sent by browser JavaScript in the JSON "project"
-  # field. This is not a secret, but it should be stable across restarts.
-  key: replace-with-public-project-key
-  name: main
+projects:
+  - # Public project identifier sent by browser JavaScript in the JSON "project"
+    # field. This is not a secret, but it should be stable across restarts.
+    key: replace-with-public-project-key
+    name: main
 
-  # Exact browser Origin values allowed to submit forms.
-  allowed_origins:
-    - https://example.com
-    - https://www.example.com
+    # Server-controlled From header used for this project's outgoing email.
+    from: Website Contact <contact@example.com>
 
-  # Server-controlled destination addresses. The browser cannot choose
-  # recipients.
-  recipients:
-    - Website Owner <you@example.com>
+    # Exact browser Origin values allowed to submit forms for this project.
+    allowed_origins:
+      - https://example.com
+      - https://www.example.com
+
+    # Server-controlled destination addresses for this project. The browser
+    # cannot choose recipients.
+    recipients:
+      - Website Owner <you@example.com>
 
 mail:
-  # Server-controlled From header used for outgoing email.
-  from: Website Contact <contact@example.com>
-
   # Supported values: smtp, mailtrap.
   delivery_provider: smtp
 

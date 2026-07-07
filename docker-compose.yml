@@ -7,8 +7,10 @@ services:
       - "8080:8080"
     volumes:
       - email-data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
     environment:
       DATABASE_PATH: /app/data/relay-house.db
+    command: ["relay-house", "-config", "/app/config.yaml"]
     restart: unless-stopped
 
 volumes:

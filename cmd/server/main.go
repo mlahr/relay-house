@@ -43,11 +43,7 @@ type Config struct {
 	Addr              string
 	DatabasePath      string
 	DeliveryProvider  string
-	ProjectKey        string
-	ProjectName       string
-	AllowedOrigins    []string
-	Recipients        []string
-	From              string
+	Projects          []ProjectConfig
 	SMTPHost          string
 	SMTPPort          int
 	SMTPUsername      string
@@ -65,12 +61,21 @@ type Config struct {
 	IPHashSecret      string
 }
 
+type ProjectConfig struct {
+	Key            string
+	Name           string
+	From           string
+	AllowedOrigins []string
+	Recipients     []string
+	originSet      map[string]struct{}
+}
+
 type App struct {
-	cfg       Config
-	db        *sql.DB
-	log       *slog.Logger
-	originSet map[string]struct{}
-	now       func() time.Time
+	cfg        Config
+	db         *sql.DB
+	log        *slog.Logger
+	projectMap map[string]ProjectConfig
+	now        func() time.Time
 }
 
 type SendRequest struct {
@@ -92,6 +97,8 @@ type job struct {
 	ID           string
 	SubmissionID string
 	ProjectKey   string
+	From         string
+	Recipients   []string
 	Name         string
 	Email        string
 	Subject      string
@@ -136,14 +143,8 @@ type fileConfig struct {
 	Database struct {
 		Path string `yaml:"path"`
 	} `yaml:"database"`
-	Project struct {
-		Key            string   `yaml:"key"`
-		Name           string   `yaml:"name"`
-		AllowedOrigins []string `yaml:"allowed_origins"`
-		Recipients     []string `yaml:"recipients"`
-	} `yaml:"project"`
-	Mail struct {
-		From             string `yaml:"from"`
+	Projects []fileProject `yaml:"projects"`
+	Mail     struct {
 		DeliveryProvider string `yaml:"delivery_provider"`
 		SMTP             struct {
 			Host          string `yaml:"host"`
@@ -175,6 +176,14 @@ type fileConfig struct {
 	Security struct {
 		IPHashSecret string `yaml:"ip_hash_secret"`
 	} `yaml:"security"`
+}
+
+type fileProject struct {
+	Key            string   `yaml:"key"`
+	Name           string   `yaml:"name"`
+	From           string   `yaml:"from"`
+	AllowedOrigins []string `yaml:"allowed_origins"`
+	Recipients     []string `yaml:"recipients"`
 }
 
 func main() {
@@ -211,18 +220,18 @@ func main() {
 	db.SetMaxOpenConns(1)
 
 	app := &App{
-		cfg:       cfg,
-		db:        db,
-		log:       logger,
-		originSet: makeOriginSet(cfg.AllowedOrigins),
-		now:       time.Now,
+		cfg:        cfg,
+		db:         db,
+		log:        logger,
+		projectMap: makeProjectMap(cfg.Projects),
+		now:        time.Now,
 	}
 
 	if err := app.migrate(context.Background()); err != nil {
 		logger.Error("db.migrate_failed", "error", err)
 		os.Exit(1)
 	}
-	if err := app.seedProject(context.Background()); err != nil {
+	if err := app.seedProjects(context.Background()); err != nil {
 		logger.Error("db.seed_failed", "error", err)
 		os.Exit(1)
 	}
@@ -297,12 +306,12 @@ Configuration:
     compiled defaults < YAML config from -config < environment variables
 
   Validation-required settings:
-    ALLOWED_ORIGINS
-    RECIPIENTS
-    MAIL_FROM
+    projects[].key
+    projects[].from
+    projects[].allowed_origins
+    projects[].recipients
 
   Recommended persistent settings:
-    PROJECT_KEY
     IP_HASH_SECRET
 
   SMTP delivery also requires:
@@ -561,7 +570,6 @@ func defaultConfig() Config {
 		Addr:             ":8080",
 		DatabasePath:     "relay-house.db",
 		DeliveryProvider: "smtp",
-		ProjectName:      "default",
 		SMTPPort:         587,
 		MailtrapAPIURL:   "https://send.api.mailtrap.io/api/send",
 		RateMinute:       5,
@@ -584,11 +592,20 @@ func applyYAMLConfig(cfg *Config, path string) error {
 
 	setString(&cfg.Addr, file.HTTP.Address)
 	setString(&cfg.DatabasePath, file.Database.Path)
-	setString(&cfg.ProjectKey, file.Project.Key)
-	setString(&cfg.ProjectName, file.Project.Name)
-	setStrings(&cfg.AllowedOrigins, file.Project.AllowedOrigins)
-	setStrings(&cfg.Recipients, file.Project.Recipients)
-	setString(&cfg.From, file.Mail.From)
+	if len(file.Projects) > 0 {
+		projects := make([]ProjectConfig, 0, len(file.Projects))
+		for _, item := range file.Projects {
+			project := ProjectConfig{
+				Key:            strings.TrimSpace(item.Key),
+				Name:           strings.TrimSpace(item.Name),
+				From:           strings.TrimSpace(item.From),
+				AllowedOrigins: trimStrings(item.AllowedOrigins),
+				Recipients:     trimStrings(item.Recipients),
+			}
+			projects = append(projects, project)
+		}
+		cfg.Projects = projects
+	}
 	setString(&cfg.DeliveryProvider, strings.ToLower(file.Mail.DeliveryProvider))
 	setString(&cfg.SMTPHost, file.Mail.SMTP.Host)
 	setInt(&cfg.SMTPPort, file.Mail.SMTP.Port)
@@ -614,11 +631,6 @@ func applyEnvConfig(cfg *Config) error {
 	setStringFromEnv(&cfg.Addr, "ADDR")
 	setStringFromEnv(&cfg.DatabasePath, "DATABASE_PATH")
 	setLowerStringFromEnv(&cfg.DeliveryProvider, "DELIVERY_PROVIDER")
-	setStringFromEnv(&cfg.ProjectKey, "PROJECT_KEY")
-	setStringFromEnv(&cfg.ProjectName, "PROJECT_NAME")
-	setCSVFromEnv(&cfg.AllowedOrigins, "ALLOWED_ORIGINS")
-	setCSVFromEnv(&cfg.Recipients, "RECIPIENTS")
-	setStringFromEnv(&cfg.From, "MAIL_FROM")
 	setStringFromEnv(&cfg.SMTPHost, "SMTP_HOST")
 	if err := setIntFromEnv(&cfg.SMTPPort, "SMTP_PORT"); err != nil {
 		return err
@@ -657,21 +669,43 @@ func applyEnvConfig(cfg *Config) error {
 
 func validateConfig(cfg Config) (Config, error) {
 	cfg.DeliveryProvider = strings.ToLower(strings.TrimSpace(cfg.DeliveryProvider))
-	if cfg.ProjectKey == "" {
-		generated, err := randomToken(24)
-		if err != nil {
-			return Config{}, err
+	if len(cfg.Projects) == 0 {
+		return Config{}, errors.New("at least one project is required")
+	}
+	seen := make(map[string]struct{}, len(cfg.Projects))
+	for i := range cfg.Projects {
+		project := &cfg.Projects[i]
+		project.Key = strings.TrimSpace(project.Key)
+		project.Name = strings.TrimSpace(project.Name)
+		project.From = strings.TrimSpace(project.From)
+		project.AllowedOrigins = trimStrings(project.AllowedOrigins)
+		project.Recipients = trimStrings(project.Recipients)
+		if project.Key == "" {
+			return Config{}, fmt.Errorf("projects[%d].key is required", i)
 		}
-		cfg.ProjectKey = generated
-	}
-	if len(cfg.AllowedOrigins) == 0 {
-		return Config{}, errors.New("ALLOWED_ORIGINS is required")
-	}
-	if len(cfg.Recipients) == 0 {
-		return Config{}, errors.New("RECIPIENTS is required")
-	}
-	if cfg.From == "" {
-		return Config{}, errors.New("MAIL_FROM is required")
+		if _, ok := seen[project.Key]; ok {
+			return Config{}, fmt.Errorf("duplicate project key %q", project.Key)
+		}
+		seen[project.Key] = struct{}{}
+		if project.Name == "" {
+			project.Name = project.Key
+		}
+		if project.From == "" {
+			return Config{}, fmt.Errorf("projects[%d].from is required", i)
+		}
+		if _, err := mail.ParseAddress(project.From); err != nil {
+			return Config{}, fmt.Errorf("projects[%d].from is invalid: %w", i, err)
+		}
+		if len(project.AllowedOrigins) == 0 {
+			return Config{}, fmt.Errorf("projects[%d].allowed_origins is required", i)
+		}
+		if len(project.Recipients) == 0 {
+			return Config{}, fmt.Errorf("projects[%d].recipients is required", i)
+		}
+		if _, err := envelopeAddresses(project.Recipients); err != nil {
+			return Config{}, fmt.Errorf("projects[%d].recipients is invalid: %w", i, err)
+		}
+		project.originSet = makeOriginSet(project.AllowedOrigins)
 	}
 	switch cfg.DeliveryProvider {
 	case "smtp":
@@ -728,21 +762,13 @@ func (a *App) health(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) options(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
-	if a.originAllowed(origin) {
+	if a.originAllowedByAnyProject(origin) {
 		setCORS(w, origin)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *App) send(w http.ResponseWriter, r *http.Request) {
-	origin := r.Header.Get("Origin")
-	if !a.originAllowed(origin) {
-		a.log.Warn("request.origin_rejected", "origin", origin)
-		writeJSON(w, http.StatusForbidden, SendResponse{Status: "rejected", Error: "origin not allowed"})
-		return
-	}
-	setCORS(w, origin)
-
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 	defer r.Body.Close()
 
@@ -758,10 +784,18 @@ func (a *App) send(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, SendResponse{Status: "rejected", Error: err.Error()})
 		return
 	}
-	if req.Project != a.cfg.ProjectKey {
+	project, ok := a.projectMap[req.Project]
+	if !ok {
 		writeJSON(w, http.StatusForbidden, SendResponse{Status: "rejected", Error: "unknown project"})
 		return
 	}
+	origin := r.Header.Get("Origin")
+	if !project.originAllowed(origin) {
+		a.log.Warn("request.origin_rejected", "project", req.Project, "origin", origin)
+		writeJSON(w, http.StatusForbidden, SendResponse{Status: "rejected", Error: "origin not allowed"})
+		return
+	}
+	setCORS(w, origin)
 
 	ip := clientIP(r)
 	ipHash := a.hashIP(ip)
@@ -835,6 +869,7 @@ func (a *App) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS projects (
 			key TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
+			from_address TEXT NOT NULL DEFAULT '',
 			recipients_json TEXT NOT NULL,
 			allowed_origins_json TEXT NOT NULL,
 			created_at TEXT NOT NULL,
@@ -893,29 +928,96 @@ func (a *App) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := a.ensureProjectFromColumn(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (a *App) seedProject(ctx context.Context) error {
-	now := a.now().UTC().Format(time.RFC3339Nano)
-	recipients, err := json.Marshal(a.cfg.Recipients)
+func (a *App) ensureProjectFromColumn(ctx context.Context) error {
+	hasColumn, err := tableHasColumn(ctx, a.db, "projects", "from_address")
 	if err != nil {
 		return err
 	}
-	origins, err := json.Marshal(a.cfg.AllowedOrigins)
-	if err != nil {
-		return err
+	if hasColumn {
+		return nil
 	}
-	_, err = a.db.ExecContext(ctx, `
-		INSERT INTO projects (key, name, recipients_json, allowed_origins_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(key) DO UPDATE SET
-			name = excluded.name,
-			recipients_json = excluded.recipients_json,
-			allowed_origins_json = excluded.allowed_origins_json,
-			updated_at = excluded.updated_at
-	`, a.cfg.ProjectKey, a.cfg.ProjectName, string(recipients), string(origins), now, now)
+	_, err = a.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN from_address TEXT NOT NULL DEFAULT ''`)
 	return err
+}
+
+func tableHasColumn(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name string
+		var typ string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func (a *App) seedProjects(ctx context.Context) error {
+	now := a.now().UTC().Format(time.RFC3339Nano)
+	for _, project := range a.cfg.Projects {
+		recipients, err := json.Marshal(project.Recipients)
+		if err != nil {
+			return err
+		}
+		origins, err := json.Marshal(project.AllowedOrigins)
+		if err != nil {
+			return err
+		}
+		_, err = a.db.ExecContext(ctx, `
+			INSERT INTO projects (key, name, from_address, recipients_json, allowed_origins_json, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET
+				name = excluded.name,
+				from_address = excluded.from_address,
+				recipients_json = excluded.recipients_json,
+				allowed_origins_json = excluded.allowed_origins_json,
+				updated_at = excluded.updated_at
+		`, project.Key, project.Name, project.From, string(recipients), string(origins), now, now)
+		if err != nil {
+			return err
+		}
+	}
+	return a.ensureAllStoredProjectsHaveFrom(ctx)
+}
+
+func (a *App) ensureAllStoredProjectsHaveFrom(ctx context.Context) error {
+	rows, err := a.db.QueryContext(ctx, `SELECT key FROM projects WHERE from_address = '' ORDER BY key`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var missing []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return err
+		}
+		missing = append(missing, key)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("stored projects missing from_address after migration: %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func (a *App) storeSubmission(ctx context.Context, req SendRequest, origin, ipHash, userAgent string) (string, error) {
@@ -1068,6 +1170,12 @@ func (a *App) claimJob(ctx context.Context) (job, bool, error) {
 	if err != nil {
 		return job{}, false, err
 	}
+	project, ok := a.projectMap[j.ProjectKey]
+	if !ok {
+		return job{}, false, fmt.Errorf("project %q is not configured", j.ProjectKey)
+	}
+	j.From = project.From
+	j.Recipients = project.Recipients
 
 	if err := tx.Commit(); err != nil {
 		return job{}, false, err
@@ -1157,9 +1265,9 @@ func (a *App) deliver(ctx context.Context, j job) deliveryResult {
 }
 
 func (a *App) sendSMTP(j job) error {
-	fromAddr, err := mail.ParseAddress(a.cfg.From)
+	fromAddr, err := mail.ParseAddress(j.From)
 	if err != nil {
-		return fmt.Errorf("invalid MAIL_FROM: %w", err)
+		return fmt.Errorf("invalid project from: %w", err)
 	}
 	replyTo, err := mail.ParseAddress(fmt.Sprintf("%s <%s>", j.Name, j.Email))
 	if err != nil {
@@ -1168,7 +1276,7 @@ func (a *App) sendSMTP(j job) error {
 
 	var msg bytes.Buffer
 	writeHeader(&msg, "From", fromAddr.String())
-	writeHeader(&msg, "To", strings.Join(a.cfg.Recipients, ", "))
+	writeHeader(&msg, "To", strings.Join(j.Recipients, ", "))
 	writeHeader(&msg, "Reply-To", replyTo.String())
 	writeHeader(&msg, "Subject", j.Subject)
 	writeHeader(&msg, "MIME-Version", "1.0")
@@ -1179,7 +1287,7 @@ func (a *App) sendSMTP(j job) error {
 	msg.WriteString("\r\n")
 
 	auth := smtp.PlainAuth("", a.cfg.SMTPUsername, a.cfg.SMTPPassword, a.cfg.SMTPHost)
-	envelopeRecipients, err := envelopeAddresses(a.cfg.Recipients)
+	envelopeRecipients, err := envelopeAddresses(j.Recipients)
 	if err != nil {
 		return err
 	}
@@ -1194,9 +1302,9 @@ func (a *App) sendSMTP(j job) error {
 }
 
 func (a *App) sendMailtrap(ctx context.Context, j job) (string, error) {
-	fromAddr, err := mail.ParseAddress(a.cfg.From)
+	fromAddr, err := mail.ParseAddress(j.From)
 	if err != nil {
-		return "", fmt.Errorf("invalid MAIL_FROM: %w", err)
+		return "", fmt.Errorf("invalid project from: %w", err)
 	}
 	replyTo, err := mail.ParseAddress(fmt.Sprintf("%s <%s>", j.Name, j.Email))
 	if err != nil {
@@ -1215,7 +1323,7 @@ func (a *App) sendMailtrap(ctx context.Context, j job) (string, error) {
 
 	body := payload{
 		From:    mailtrapAddress{Email: fromAddr.Address, Name: fromAddr.Name},
-		To:      addressesFromEmails(a.cfg.Recipients),
+		To:      addressesFromEmails(j.Recipients),
 		BCC:     addressesFromEmails(a.cfg.MailtrapBCC),
 		ReplyTo: mailtrapAddress{Email: replyTo.Address, Name: replyTo.Name},
 		Subject: j.Subject,
@@ -1385,11 +1493,23 @@ func (a *App) verifyTurnstile(ctx context.Context, token, remoteIP string) error
 	return nil
 }
 
-func (a *App) originAllowed(origin string) bool {
+func (a *App) originAllowedByAnyProject(origin string) bool {
 	if origin == "" {
 		return false
 	}
-	_, ok := a.originSet[origin]
+	for _, project := range a.projectMap {
+		if project.originAllowed(origin) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p ProjectConfig) originAllowed(origin string) bool {
+	if origin == "" {
+		return false
+	}
+	_, ok := p.originSet[origin]
 	return ok
 }
 
@@ -1434,9 +1554,23 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 func makeOriginSet(origins []string) map[string]struct{} {
 	set := make(map[string]struct{}, len(origins))
 	for _, origin := range origins {
-		set[origin] = struct{}{}
+		origin = strings.TrimSpace(origin)
+		if origin != "" {
+			set[origin] = struct{}{}
+		}
 	}
 	return set
+}
+
+func makeProjectMap(projects []ProjectConfig) map[string]ProjectConfig {
+	projectMap := make(map[string]ProjectConfig, len(projects))
+	for _, project := range projects {
+		if project.originSet == nil {
+			project.originSet = makeOriginSet(project.AllowedOrigins)
+		}
+		projectMap[project.Key] = project
+	}
+	return projectMap
 }
 
 func splitCSV(value string) []string {
@@ -1449,6 +1583,17 @@ func splitCSV(value string) []string {
 		part = strings.TrimSpace(part)
 		if part != "" {
 			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func trimStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
 		}
 	}
 	return out

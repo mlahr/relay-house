@@ -14,11 +14,12 @@ Self-hosted email relay for browser-based website forms.
 
 ## Run
 
-Docker/local env mode:
+Docker:
 
 ```sh
+cp config.example.yaml config.yaml
 cp .env.example .env
-# edit .env
+# edit config.yaml and optional transport overrides in .env
 docker compose up --build
 ```
 
@@ -72,7 +73,8 @@ Success returns `202 Accepted`:
 
 ## Configuration
 
-RelayHouse can be configured with YAML, environment variables, or both.
+RelayHouse project definitions are configured with YAML. Transport and runtime
+settings can be overridden with environment variables.
 
 Start from the example YAML file:
 
@@ -82,28 +84,28 @@ $EDITOR config.yaml
 relay-house -config config.yaml
 ```
 
-For Docker/local environment variable mode, start from `.env.example`:
+For Docker/local transport overrides, start from `.env.example`:
 
 ```sh
 cp .env.example .env
 $EDITOR .env
 ```
 
-Configuration precedence is:
+Transport/runtime configuration precedence is:
 
 ```txt
 compiled defaults < YAML config from -config < environment variables
 ```
 
-That means environment variables override matching YAML values.
+That means environment variables override matching non-project YAML values.
 
-`PROJECT_KEY` is a public identifier used by your website JavaScript. It is not a secret.
+Each `projects[].key` is a public identifier used by your website JavaScript. It is not a secret.
 
-`RECIPIENTS` and `MAIL_FROM` are server-controlled. The browser cannot choose arbitrary recipients.
+`projects[].from` and `projects[].recipients` are server-controlled. The browser cannot choose arbitrary senders or recipients.
 
 `TURNSTILE_SECRET` is optional. If set, requests must include `turnstileToken`.
 
-`PROJECT_KEY` and `IP_HASH_SECRET` are generated if omitted. Set both explicitly in production so the browser project key and rate-limit hashing remain stable across restarts.
+Set `projects[].key` and `security.ip_hash_secret` explicitly in production so the browser project key and rate-limit hashing remain stable across restarts.
 
 ### YAML Reference
 
@@ -111,11 +113,11 @@ That means environment variables override matching YAML values.
 | --- | --- | --- | --- |
 | `http.address` | `ADDR` | `:8080` | HTTP listen address. |
 | `database.path` | `DATABASE_PATH` | `relay-house.db` | SQLite database path. |
-| `project.key` | `PROJECT_KEY` | generated | Public project key expected in request JSON. Set explicitly in production. |
-| `project.name` | `PROJECT_NAME` | `default` | Stored project display name. |
-| `project.allowed_origins` | `ALLOWED_ORIGINS` | none | Required. YAML list or comma-separated env var of exact browser origins. |
-| `project.recipients` | `RECIPIENTS` | none | Required. YAML list or comma-separated env var of destination addresses. |
-| `mail.from` | `MAIL_FROM` | none | Required. Server-controlled sender address. |
+| `projects[].key` | none | none | Required. Public project key expected in request JSON. |
+| `projects[].name` | none | project key | Stored project display name. |
+| `projects[].from` | none | none | Required. Server-controlled sender address for this project. |
+| `projects[].allowed_origins` | none | none | Required. Exact browser origins for this project. |
+| `projects[].recipients` | none | none | Required. Destination addresses for this project. |
 | `mail.delivery_provider` | `DELIVERY_PROVIDER` | `smtp` | Supported values: `smtp`, `mailtrap`. |
 | `mail.smtp.host` | `SMTP_HOST` | none | Required when `mail.delivery_provider` is `smtp`. |
 | `mail.smtp.port` | `SMTP_PORT` | `587` | SMTP port. |
@@ -136,15 +138,15 @@ That means environment variables override matching YAML values.
 ### Minimal SMTP YAML
 
 ```yaml
-project:
-  key: replace-with-public-project-key
-  allowed_origins:
-    - https://example.com
-  recipients:
-    - Website Owner <you@example.com>
+projects:
+  - key: replace-with-public-project-key
+    from: Website Contact <contact@example.com>
+    allowed_origins:
+      - https://example.com
+    recipients:
+      - Website Owner <you@example.com>
 
 mail:
-  from: Website Contact <contact@example.com>
   delivery_provider: smtp
   smtp:
     host: smtp.example.com
@@ -158,15 +160,15 @@ security:
 ### Minimal Mailtrap YAML
 
 ```yaml
-project:
-  key: replace-with-public-project-key
-  allowed_origins:
-    - https://example.com
-  recipients:
-    - Website Owner <you@example.com>
+projects:
+  - key: replace-with-public-project-key
+    from: Website Contact <contact@example.com>
+    allowed_origins:
+      - https://example.com
+    recipients:
+      - Website Owner <you@example.com>
 
 mail:
-  from: Website Contact <contact@example.com>
   delivery_provider: mailtrap
   mailtrap:
     api_token: your-token
