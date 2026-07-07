@@ -36,6 +36,29 @@ providers:
     # Set true only for SMTP servers that require plaintext auth without TLS.
     insecure_plain_auth: false
 
+  - name: mailtrap-main
+    type: mailtrap
+
+    # Server-controlled From header and destinations for Mailtrap delivery.
+    from: Website Contact <contact@example.com>
+    recipients:
+      - Website Owner <you@example.com>
+
+    # Required for mailtrap providers.
+    api_url: https://send.api.mailtrap.io/api/send
+    api_token: replace-with-mailtrap-token
+
+    # Optional blind-copy recipients for Mailtrap API delivery.
+    bcc: []
+
+  - name: telegram-main
+    type: telegram
+
+    # Required for telegram providers.
+    bot_token: replace-with-telegram-bot-token
+    chat_ids:
+      - 123456789
+
 projects:
   - # Public project identifier sent by browser JavaScript in the JSON "project"
     # field. This is not a secret, but it should be stable across restarts.
