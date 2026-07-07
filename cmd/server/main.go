@@ -39,11 +39,35 @@ var version = "dev"
 
 const packagedConfigPath = "/etc/relay-house/config.yaml"
 
+const telegramAPIBase = "https://api.telegram.org"
+
 type Config struct {
-	Addr              string
-	DatabasePath      string
-	DeliveryProvider  string
-	Projects          []ProjectConfig
+	Addr            string
+	DatabasePath    string
+	Providers       []ProviderConfig
+	Projects        []ProjectConfig
+	TurnstileSecret string
+	RateMinute      int
+	RateDay         int
+	MaxRetries      int
+	WorkerInterval  time.Duration
+	RetentionDays   int
+	IPHashSecret    string
+}
+
+type ProjectConfig struct {
+	Key            string
+	Name           string
+	AllowedOrigins []string
+	ProviderName   string
+	originSet      map[string]struct{}
+}
+
+type ProviderConfig struct {
+	Name              string
+	Type              string
+	From              string
+	Recipients        []string
 	SMTPHost          string
 	SMTPPort          int
 	SMTPUsername      string
@@ -52,30 +76,18 @@ type Config struct {
 	MailtrapAPIURL    string
 	MailtrapAPIToken  string
 	MailtrapBCC       []string
-	TurnstileSecret   string
-	RateMinute        int
-	RateDay           int
-	MaxRetries        int
-	WorkerInterval    time.Duration
-	RetentionDays     int
-	IPHashSecret      string
-}
-
-type ProjectConfig struct {
-	Key            string
-	Name           string
-	From           string
-	AllowedOrigins []string
-	Recipients     []string
-	originSet      map[string]struct{}
+	TelegramBotToken  string
+	TelegramChatIDs   []int64
+	TelegramAPIBase   string
 }
 
 type App struct {
-	cfg        Config
-	db         *sql.DB
-	log        *slog.Logger
-	projectMap map[string]ProjectConfig
-	now        func() time.Time
+	cfg         Config
+	db          *sql.DB
+	log         *slog.Logger
+	projectMap  map[string]ProjectConfig
+	providerMap map[string]ProviderConfig
+	now         func() time.Time
 }
 
 type SendRequest struct {
@@ -97,8 +109,7 @@ type job struct {
 	ID           string
 	SubmissionID string
 	ProjectKey   string
-	From         string
-	Recipients   []string
+	Provider     ProviderConfig
 	Name         string
 	Email        string
 	Subject      string
@@ -115,6 +126,12 @@ type deliveryResult struct {
 type mailtrapAddress struct {
 	Email string `json:"email"`
 	Name  string `json:"name,omitempty"`
+}
+
+type telegramResponse struct {
+	OK          bool            `json:"ok"`
+	Result      json.RawMessage `json:"result"`
+	Description string          `json:"description"`
 }
 
 type eventCommandOptions struct {
@@ -143,22 +160,8 @@ type fileConfig struct {
 	Database struct {
 		Path string `yaml:"path"`
 	} `yaml:"database"`
-	Projects []fileProject `yaml:"projects"`
-	Mail     struct {
-		DeliveryProvider string `yaml:"delivery_provider"`
-		SMTP             struct {
-			Host          string `yaml:"host"`
-			Port          int    `yaml:"port"`
-			Username      string `yaml:"username"`
-			Password      string `yaml:"password"`
-			InsecurePlain bool   `yaml:"insecure_plain_auth"`
-		} `yaml:"smtp"`
-		Mailtrap struct {
-			APIURL   string   `yaml:"api_url"`
-			APIToken string   `yaml:"api_token"`
-			BCC      []string `yaml:"bcc"`
-		} `yaml:"mailtrap"`
-	} `yaml:"mail"`
+	Providers []fileProvider `yaml:"providers"`
+	Projects  []fileProject  `yaml:"projects"`
 	Turnstile struct {
 		Secret string `yaml:"secret"`
 	} `yaml:"turnstile"`
@@ -181,9 +184,25 @@ type fileConfig struct {
 type fileProject struct {
 	Key            string   `yaml:"key"`
 	Name           string   `yaml:"name"`
-	From           string   `yaml:"from"`
 	AllowedOrigins []string `yaml:"allowed_origins"`
-	Recipients     []string `yaml:"recipients"`
+	ProviderName   string   `yaml:"provider"`
+}
+
+type fileProvider struct {
+	Name              string   `yaml:"name"`
+	Type              string   `yaml:"type"`
+	From              string   `yaml:"from"`
+	Recipients        []string `yaml:"recipients"`
+	SMTPHost          string   `yaml:"host"`
+	SMTPPort          int      `yaml:"port"`
+	SMTPUsername      string   `yaml:"username"`
+	SMTPPassword      string   `yaml:"password"`
+	SMTPInsecurePlain bool     `yaml:"insecure_plain_auth"`
+	MailtrapAPIURL    string   `yaml:"api_url"`
+	MailtrapAPIToken  string   `yaml:"api_token"`
+	MailtrapBCC       []string `yaml:"bcc"`
+	TelegramBotToken  string   `yaml:"bot_token"`
+	TelegramChatIDs   []int64  `yaml:"chat_ids"`
 }
 
 func main() {
@@ -220,11 +239,12 @@ func main() {
 	db.SetMaxOpenConns(1)
 
 	app := &App{
-		cfg:        cfg,
-		db:         db,
-		log:        logger,
-		projectMap: makeProjectMap(cfg.Projects),
-		now:        time.Now,
+		cfg:         cfg,
+		db:          db,
+		log:         logger,
+		projectMap:  makeProjectMap(cfg.Projects),
+		providerMap: makeProviderMap(cfg.Providers),
+		now:         time.Now,
 	}
 
 	if err := app.migrate(context.Background()); err != nil {
@@ -307,21 +327,13 @@ Configuration:
 
   Validation-required settings:
     projects[].key
-    projects[].from
     projects[].allowed_origins
-    projects[].recipients
+    projects[].provider
+    providers[].name
+    providers[].type
 
   Recommended persistent settings:
     IP_HASH_SECRET
-
-  SMTP delivery also requires:
-    SMTP_HOST
-    SMTP_USERNAME
-    SMTP_PASSWORD
-
-  Mailtrap delivery also requires:
-    DELIVERY_PROVIDER=mailtrap
-    MAILTRAP_API_TOKEN
 
 Examples:
   relay-house -config /etc/relay-house/config.yaml
@@ -567,16 +579,13 @@ func loadConfigFromArgs(args []string) (Config, error) {
 
 func defaultConfig() Config {
 	return Config{
-		Addr:             ":8080",
-		DatabasePath:     "relay-house.db",
-		DeliveryProvider: "smtp",
-		SMTPPort:         587,
-		MailtrapAPIURL:   "https://send.api.mailtrap.io/api/send",
-		RateMinute:       5,
-		RateDay:          100,
-		MaxRetries:       5,
-		WorkerInterval:   5 * time.Second,
-		RetentionDays:    365,
+		Addr:           ":8080",
+		DatabasePath:   "relay-house.db",
+		RateMinute:     5,
+		RateDay:        100,
+		MaxRetries:     5,
+		WorkerInterval: 5 * time.Second,
+		RetentionDays:  365,
 	}
 }
 
@@ -592,29 +601,43 @@ func applyYAMLConfig(cfg *Config, path string) error {
 
 	setString(&cfg.Addr, file.HTTP.Address)
 	setString(&cfg.DatabasePath, file.Database.Path)
+	if len(file.Providers) > 0 {
+		providers := make([]ProviderConfig, 0, len(file.Providers))
+		for _, item := range file.Providers {
+			provider := ProviderConfig{
+				Name:              strings.TrimSpace(item.Name),
+				Type:              strings.ToLower(strings.TrimSpace(item.Type)),
+				From:              strings.TrimSpace(item.From),
+				Recipients:        trimStrings(item.Recipients),
+				SMTPHost:          strings.TrimSpace(item.SMTPHost),
+				SMTPPort:          item.SMTPPort,
+				SMTPUsername:      strings.TrimSpace(item.SMTPUsername),
+				SMTPPassword:      strings.TrimSpace(item.SMTPPassword),
+				SMTPInsecurePlain: item.SMTPInsecurePlain,
+				MailtrapAPIURL:    strings.TrimSpace(item.MailtrapAPIURL),
+				MailtrapAPIToken:  strings.TrimSpace(item.MailtrapAPIToken),
+				MailtrapBCC:       trimStrings(item.MailtrapBCC),
+				TelegramBotToken:  strings.TrimSpace(item.TelegramBotToken),
+				TelegramChatIDs:   append([]int64(nil), item.TelegramChatIDs...),
+				TelegramAPIBase:   telegramAPIBase,
+			}
+			providers = append(providers, provider)
+		}
+		cfg.Providers = providers
+	}
 	if len(file.Projects) > 0 {
 		projects := make([]ProjectConfig, 0, len(file.Projects))
 		for _, item := range file.Projects {
 			project := ProjectConfig{
 				Key:            strings.TrimSpace(item.Key),
 				Name:           strings.TrimSpace(item.Name),
-				From:           strings.TrimSpace(item.From),
 				AllowedOrigins: trimStrings(item.AllowedOrigins),
-				Recipients:     trimStrings(item.Recipients),
+				ProviderName:   strings.TrimSpace(item.ProviderName),
 			}
 			projects = append(projects, project)
 		}
 		cfg.Projects = projects
 	}
-	setString(&cfg.DeliveryProvider, strings.ToLower(file.Mail.DeliveryProvider))
-	setString(&cfg.SMTPHost, file.Mail.SMTP.Host)
-	setInt(&cfg.SMTPPort, file.Mail.SMTP.Port)
-	setString(&cfg.SMTPUsername, file.Mail.SMTP.Username)
-	setString(&cfg.SMTPPassword, file.Mail.SMTP.Password)
-	cfg.SMTPInsecurePlain = file.Mail.SMTP.InsecurePlain
-	setString(&cfg.MailtrapAPIURL, file.Mail.Mailtrap.APIURL)
-	setString(&cfg.MailtrapAPIToken, file.Mail.Mailtrap.APIToken)
-	setStrings(&cfg.MailtrapBCC, file.Mail.Mailtrap.BCC)
 	setString(&cfg.TurnstileSecret, file.Turnstile.Secret)
 	setInt(&cfg.RateMinute, file.RateLimit.PerMinute)
 	setInt(&cfg.RateDay, file.RateLimit.PerDay)
@@ -630,19 +653,6 @@ func applyYAMLConfig(cfg *Config, path string) error {
 func applyEnvConfig(cfg *Config) error {
 	setStringFromEnv(&cfg.Addr, "ADDR")
 	setStringFromEnv(&cfg.DatabasePath, "DATABASE_PATH")
-	setLowerStringFromEnv(&cfg.DeliveryProvider, "DELIVERY_PROVIDER")
-	setStringFromEnv(&cfg.SMTPHost, "SMTP_HOST")
-	if err := setIntFromEnv(&cfg.SMTPPort, "SMTP_PORT"); err != nil {
-		return err
-	}
-	setStringFromEnv(&cfg.SMTPUsername, "SMTP_USERNAME")
-	setStringFromEnv(&cfg.SMTPPassword, "SMTP_PASSWORD")
-	if err := setBoolFromEnv(&cfg.SMTPInsecurePlain, "SMTP_INSECURE_PLAIN_AUTH"); err != nil {
-		return err
-	}
-	setStringFromEnv(&cfg.MailtrapAPIURL, "MAILTRAP_API_URL")
-	setStringFromEnv(&cfg.MailtrapAPIToken, "MAILTRAP_API_TOKEN")
-	setCSVFromEnv(&cfg.MailtrapBCC, "MAILTRAP_BCC")
 	setStringFromEnv(&cfg.TurnstileSecret, "TURNSTILE_SECRET")
 	if err := setIntFromEnv(&cfg.RateMinute, "RATE_LIMIT_PER_MINUTE"); err != nil {
 		return err
@@ -668,7 +678,91 @@ func applyEnvConfig(cfg *Config) error {
 }
 
 func validateConfig(cfg Config) (Config, error) {
-	cfg.DeliveryProvider = strings.ToLower(strings.TrimSpace(cfg.DeliveryProvider))
+	if len(cfg.Providers) == 0 {
+		return Config{}, errors.New("at least one provider is required")
+	}
+	providerMap := make(map[string]ProviderConfig, len(cfg.Providers))
+	for i := range cfg.Providers {
+		provider := &cfg.Providers[i]
+		provider.Name = strings.TrimSpace(provider.Name)
+		provider.Type = strings.ToLower(strings.TrimSpace(provider.Type))
+		provider.From = strings.TrimSpace(provider.From)
+		provider.Recipients = trimStrings(provider.Recipients)
+		provider.SMTPHost = strings.TrimSpace(provider.SMTPHost)
+		provider.SMTPUsername = strings.TrimSpace(provider.SMTPUsername)
+		provider.SMTPPassword = strings.TrimSpace(provider.SMTPPassword)
+		provider.MailtrapAPIURL = strings.TrimSpace(provider.MailtrapAPIURL)
+		provider.MailtrapAPIToken = strings.TrimSpace(provider.MailtrapAPIToken)
+		provider.MailtrapBCC = trimStrings(provider.MailtrapBCC)
+		provider.TelegramBotToken = strings.TrimSpace(provider.TelegramBotToken)
+		if provider.Name == "" {
+			return Config{}, fmt.Errorf("providers[%d].name is required", i)
+		}
+		if _, ok := providerMap[provider.Name]; ok {
+			return Config{}, fmt.Errorf("duplicate provider name %q", provider.Name)
+		}
+		switch provider.Type {
+		case "smtp":
+			if provider.From == "" {
+				return Config{}, fmt.Errorf("providers[%d].from is required when type=smtp", i)
+			}
+			if _, err := mail.ParseAddress(provider.From); err != nil {
+				return Config{}, fmt.Errorf("providers[%d].from is invalid: %w", i, err)
+			}
+			if len(provider.Recipients) == 0 {
+				return Config{}, fmt.Errorf("providers[%d].recipients is required when type=smtp", i)
+			}
+			if _, err := envelopeAddresses(provider.Recipients); err != nil {
+				return Config{}, fmt.Errorf("providers[%d].recipients is invalid: %w", i, err)
+			}
+			if provider.SMTPHost == "" {
+				return Config{}, fmt.Errorf("providers[%d].host is required when type=smtp", i)
+			}
+			if provider.SMTPPort == 0 {
+				provider.SMTPPort = 587
+			}
+			if provider.SMTPUsername == "" || provider.SMTPPassword == "" {
+				return Config{}, fmt.Errorf("providers[%d].username and password are required when type=smtp", i)
+			}
+		case "mailtrap":
+			if provider.From == "" {
+				return Config{}, fmt.Errorf("providers[%d].from is required when type=mailtrap", i)
+			}
+			if _, err := mail.ParseAddress(provider.From); err != nil {
+				return Config{}, fmt.Errorf("providers[%d].from is invalid: %w", i, err)
+			}
+			if len(provider.Recipients) == 0 {
+				return Config{}, fmt.Errorf("providers[%d].recipients is required when type=mailtrap", i)
+			}
+			if _, err := envelopeAddresses(provider.Recipients); err != nil {
+				return Config{}, fmt.Errorf("providers[%d].recipients is invalid: %w", i, err)
+			}
+			if provider.MailtrapAPIToken == "" {
+				return Config{}, fmt.Errorf("providers[%d].api_token is required when type=mailtrap", i)
+			}
+			if provider.MailtrapAPIURL == "" {
+				provider.MailtrapAPIURL = "https://send.api.mailtrap.io/api/send"
+			}
+		case "telegram":
+			if provider.TelegramBotToken == "" {
+				return Config{}, fmt.Errorf("providers[%d].bot_token is required when type=telegram", i)
+			}
+			if len(provider.TelegramChatIDs) == 0 {
+				return Config{}, fmt.Errorf("providers[%d].chat_ids is required when type=telegram", i)
+			}
+			for j, chatID := range provider.TelegramChatIDs {
+				if chatID == 0 {
+					return Config{}, fmt.Errorf("providers[%d].chat_ids[%d] must not be zero", i, j)
+				}
+			}
+			if strings.TrimSpace(provider.TelegramAPIBase) == "" {
+				provider.TelegramAPIBase = telegramAPIBase
+			}
+		default:
+			return Config{}, fmt.Errorf("providers[%d].type %q is unsupported", i, provider.Type)
+		}
+		providerMap[provider.Name] = *provider
+	}
 	if len(cfg.Projects) == 0 {
 		return Config{}, errors.New("at least one project is required")
 	}
@@ -677,9 +771,8 @@ func validateConfig(cfg Config) (Config, error) {
 		project := &cfg.Projects[i]
 		project.Key = strings.TrimSpace(project.Key)
 		project.Name = strings.TrimSpace(project.Name)
-		project.From = strings.TrimSpace(project.From)
 		project.AllowedOrigins = trimStrings(project.AllowedOrigins)
-		project.Recipients = trimStrings(project.Recipients)
+		project.ProviderName = strings.TrimSpace(project.ProviderName)
 		if project.Key == "" {
 			return Config{}, fmt.Errorf("projects[%d].key is required", i)
 		}
@@ -690,40 +783,16 @@ func validateConfig(cfg Config) (Config, error) {
 		if project.Name == "" {
 			project.Name = project.Key
 		}
-		if project.From == "" {
-			return Config{}, fmt.Errorf("projects[%d].from is required", i)
-		}
-		if _, err := mail.ParseAddress(project.From); err != nil {
-			return Config{}, fmt.Errorf("projects[%d].from is invalid: %w", i, err)
-		}
 		if len(project.AllowedOrigins) == 0 {
 			return Config{}, fmt.Errorf("projects[%d].allowed_origins is required", i)
 		}
-		if len(project.Recipients) == 0 {
-			return Config{}, fmt.Errorf("projects[%d].recipients is required", i)
+		if project.ProviderName == "" {
+			return Config{}, fmt.Errorf("projects[%d].provider is required", i)
 		}
-		if _, err := envelopeAddresses(project.Recipients); err != nil {
-			return Config{}, fmt.Errorf("projects[%d].recipients is invalid: %w", i, err)
+		if _, ok := providerMap[project.ProviderName]; !ok {
+			return Config{}, fmt.Errorf("projects[%d].provider %q is not defined", i, project.ProviderName)
 		}
 		project.originSet = makeOriginSet(project.AllowedOrigins)
-	}
-	switch cfg.DeliveryProvider {
-	case "smtp":
-		if cfg.SMTPHost == "" {
-			return Config{}, errors.New("SMTP_HOST is required when DELIVERY_PROVIDER=smtp")
-		}
-		if cfg.SMTPUsername == "" || cfg.SMTPPassword == "" {
-			return Config{}, errors.New("SMTP_USERNAME and SMTP_PASSWORD are required when DELIVERY_PROVIDER=smtp")
-		}
-	case "mailtrap":
-		if cfg.MailtrapAPIToken == "" {
-			return Config{}, errors.New("MAILTRAP_API_TOKEN is required when DELIVERY_PROVIDER=mailtrap")
-		}
-		if cfg.MailtrapAPIURL == "" {
-			return Config{}, errors.New("MAILTRAP_API_URL is required when DELIVERY_PROVIDER=mailtrap")
-		}
-	default:
-		return Config{}, fmt.Errorf("unsupported DELIVERY_PROVIDER %q", cfg.DeliveryProvider)
 	}
 	if cfg.IPHashSecret == "" {
 		generated, err := randomToken(32)
@@ -972,10 +1041,6 @@ func tableHasColumn(ctx context.Context, db *sql.DB, table, column string) (bool
 func (a *App) seedProjects(ctx context.Context) error {
 	now := a.now().UTC().Format(time.RFC3339Nano)
 	for _, project := range a.cfg.Projects {
-		recipients, err := json.Marshal(project.Recipients)
-		if err != nil {
-			return err
-		}
 		origins, err := json.Marshal(project.AllowedOrigins)
 		if err != nil {
 			return err
@@ -989,33 +1054,10 @@ func (a *App) seedProjects(ctx context.Context) error {
 				recipients_json = excluded.recipients_json,
 				allowed_origins_json = excluded.allowed_origins_json,
 				updated_at = excluded.updated_at
-		`, project.Key, project.Name, project.From, string(recipients), string(origins), now, now)
+		`, project.Key, project.Name, "", "[]", string(origins), now, now)
 		if err != nil {
 			return err
 		}
-	}
-	return a.ensureAllStoredProjectsHaveFrom(ctx)
-}
-
-func (a *App) ensureAllStoredProjectsHaveFrom(ctx context.Context) error {
-	rows, err := a.db.QueryContext(ctx, `SELECT key FROM projects WHERE from_address = '' ORDER BY key`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	var missing []string
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return err
-		}
-		missing = append(missing, key)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("stored projects missing from_address after migration: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -1174,8 +1216,11 @@ func (a *App) claimJob(ctx context.Context) (job, bool, error) {
 	if !ok {
 		return job{}, false, fmt.Errorf("project %q is not configured", j.ProjectKey)
 	}
-	j.From = project.From
-	j.Recipients = project.Recipients
+	provider, ok := a.providerMap[project.ProviderName]
+	if !ok {
+		return job{}, false, fmt.Errorf("provider %q for project %q is not configured", project.ProviderName, j.ProjectKey)
+	}
+	j.Provider = provider
 
 	if err := tx.Commit(); err != nil {
 		return job{}, false, err
@@ -1242,30 +1287,33 @@ func (a *App) deliverJob(ctx context.Context, j job) {
 	}
 
 	if result.Err != nil {
-		a.log.Warn("email.delivery_failed", "provider", result.Provider, "job_id", j.ID, "submission_id", j.SubmissionID, "attempt", attemptNumber, "error", result.Err)
+		a.log.Warn("delivery.failed", "provider", result.Provider, "job_id", j.ID, "submission_id", j.SubmissionID, "attempt", attemptNumber, "error", result.Err)
 		return
 	}
-	a.log.Info("email.sent", "provider", result.Provider, "job_id", j.ID, "submission_id", j.SubmissionID, "duration_ms", duration)
+	a.log.Info("delivery.sent", "provider", result.Provider, "job_id", j.ID, "submission_id", j.SubmissionID, "duration_ms", duration)
 }
 
 func (a *App) deliver(ctx context.Context, j job) deliveryResult {
-	switch a.cfg.DeliveryProvider {
+	switch j.Provider.Type {
 	case "smtp":
-		err := a.sendSMTP(j)
+		err := a.sendSMTP(j, j.Provider)
 		if err != nil {
-			return deliveryResult{Provider: "smtp", Err: err}
+			return deliveryResult{Provider: j.Provider.Name, Err: err}
 		}
-		return deliveryResult{Provider: "smtp", Response: "accepted by smtp client"}
+		return deliveryResult{Provider: j.Provider.Name, Response: "accepted by smtp client"}
 	case "mailtrap":
-		response, err := a.sendMailtrap(ctx, j)
-		return deliveryResult{Provider: "mailtrap", Response: response, Err: err}
+		response, err := a.sendMailtrap(ctx, j, j.Provider)
+		return deliveryResult{Provider: j.Provider.Name, Response: response, Err: err}
+	case "telegram":
+		response, err := a.sendTelegram(ctx, j, j.Provider)
+		return deliveryResult{Provider: j.Provider.Name, Response: response, Err: err}
 	default:
-		return deliveryResult{Provider: a.cfg.DeliveryProvider, Err: fmt.Errorf("unsupported delivery provider %q", a.cfg.DeliveryProvider)}
+		return deliveryResult{Provider: j.Provider.Name, Err: fmt.Errorf("unsupported provider type %q", j.Provider.Type)}
 	}
 }
 
-func (a *App) sendSMTP(j job) error {
-	fromAddr, err := mail.ParseAddress(j.From)
+func (a *App) sendSMTP(j job, provider ProviderConfig) error {
+	fromAddr, err := mail.ParseAddress(provider.From)
 	if err != nil {
 		return fmt.Errorf("invalid project from: %w", err)
 	}
@@ -1276,7 +1324,7 @@ func (a *App) sendSMTP(j job) error {
 
 	var msg bytes.Buffer
 	writeHeader(&msg, "From", fromAddr.String())
-	writeHeader(&msg, "To", strings.Join(j.Recipients, ", "))
+	writeHeader(&msg, "To", strings.Join(provider.Recipients, ", "))
 	writeHeader(&msg, "Reply-To", replyTo.String())
 	writeHeader(&msg, "Subject", j.Subject)
 	writeHeader(&msg, "MIME-Version", "1.0")
@@ -1286,23 +1334,23 @@ func (a *App) sendSMTP(j job) error {
 	msg.WriteString(j.Message)
 	msg.WriteString("\r\n")
 
-	auth := smtp.PlainAuth("", a.cfg.SMTPUsername, a.cfg.SMTPPassword, a.cfg.SMTPHost)
-	envelopeRecipients, err := envelopeAddresses(j.Recipients)
+	auth := smtp.PlainAuth("", provider.SMTPUsername, provider.SMTPPassword, provider.SMTPHost)
+	envelopeRecipients, err := envelopeAddresses(provider.Recipients)
 	if err != nil {
 		return err
 	}
-	if a.cfg.SMTPPort == 465 {
-		return sendMailImplicitTLS(a.cfg.SMTPHost, a.cfg.SMTPPort, auth, fromAddr.Address, envelopeRecipients, msg.Bytes())
+	if provider.SMTPPort == 465 {
+		return sendMailImplicitTLS(provider.SMTPHost, provider.SMTPPort, auth, fromAddr.Address, envelopeRecipients, msg.Bytes())
 	}
-	if !a.cfg.SMTPInsecurePlain && a.cfg.SMTPPort == 25 {
-		return errors.New("plain SMTP auth on port 25 is disabled; set SMTP_INSECURE_PLAIN_AUTH=true to override")
+	if !provider.SMTPInsecurePlain && provider.SMTPPort == 25 {
+		return errors.New("plain SMTP auth on port 25 is disabled; set insecure_plain_auth: true to override")
 	}
-	addr := net.JoinHostPort(a.cfg.SMTPHost, strconv.Itoa(a.cfg.SMTPPort))
+	addr := net.JoinHostPort(provider.SMTPHost, strconv.Itoa(provider.SMTPPort))
 	return smtp.SendMail(addr, auth, fromAddr.Address, envelopeRecipients, msg.Bytes())
 }
 
-func (a *App) sendMailtrap(ctx context.Context, j job) (string, error) {
-	fromAddr, err := mail.ParseAddress(j.From)
+func (a *App) sendMailtrap(ctx context.Context, j job, provider ProviderConfig) (string, error) {
+	fromAddr, err := mail.ParseAddress(provider.From)
 	if err != nil {
 		return "", fmt.Errorf("invalid project from: %w", err)
 	}
@@ -1323,8 +1371,8 @@ func (a *App) sendMailtrap(ctx context.Context, j job) (string, error) {
 
 	body := payload{
 		From:    mailtrapAddress{Email: fromAddr.Address, Name: fromAddr.Name},
-		To:      addressesFromEmails(j.Recipients),
-		BCC:     addressesFromEmails(a.cfg.MailtrapBCC),
+		To:      addressesFromEmails(provider.Recipients),
+		BCC:     addressesFromEmails(provider.MailtrapBCC),
 		ReplyTo: mailtrapAddress{Email: replyTo.Address, Name: replyTo.Name},
 		Subject: j.Subject,
 		Text:    j.Message,
@@ -1334,11 +1382,11 @@ func (a *App) sendMailtrap(ctx context.Context, j job) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.MailtrapAPIURL, bytes.NewReader(encoded))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.MailtrapAPIURL, bytes.NewReader(encoded))
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.cfg.MailtrapAPIToken)
+	req.Header.Set("Authorization", "Bearer "+provider.MailtrapAPIToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
@@ -1364,6 +1412,74 @@ func (a *App) sendMailtrap(ctx context.Context, j job) (string, error) {
 		responseText = resp.Status
 	}
 	return responseText, nil
+}
+
+func (a *App) sendTelegram(ctx context.Context, j job, provider ProviderConfig) (string, error) {
+	type payload struct {
+		ChatID int64  `json:"chat_id"`
+		Text   string `json:"text"`
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	message := formatTelegramMessage(j)
+	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", strings.TrimRight(provider.TelegramAPIBase, "/"), provider.TelegramBotToken)
+	for _, chatID := range provider.TelegramChatIDs {
+		body, err := json.Marshal(payload{ChatID: chatID, Text: message})
+		if err != nil {
+			return "", err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+		responseText, readErr := readTelegramResponse(resp)
+		resp.Body.Close()
+		if readErr != nil {
+			return responseText, readErr
+		}
+	}
+	return fmt.Sprintf("sent to %d telegram chat(s)", len(provider.TelegramChatIDs)), nil
+}
+
+func readTelegramResponse(resp *http.Response) (string, error) {
+	responseBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return "", err
+	}
+	responseText := strings.TrimSpace(string(responseBytes))
+	if responseText == "" {
+		responseText = resp.Status
+	}
+
+	var result telegramResponse
+	if err := json.Unmarshal(responseBytes, &result); err != nil {
+		return responseText, fmt.Errorf("failed to decode Telegram response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !result.OK {
+		description := result.Description
+		if description == "" {
+			description = resp.Status
+		}
+		return responseText, fmt.Errorf("telegram returned %s", description)
+	}
+	return responseText, nil
+}
+
+func formatTelegramMessage(j job) string {
+	var msg strings.Builder
+	fmt.Fprintf(&msg, "New RelayHouse submission\n")
+	fmt.Fprintf(&msg, "Project: %s\n", j.ProjectKey)
+	fmt.Fprintf(&msg, "From: %s <%s>\n", j.Name, j.Email)
+	fmt.Fprintf(&msg, "Subject: %s\n\n", j.Subject)
+	msg.WriteString(j.Message)
+	return msg.String()
 }
 
 func addressesFromEmails(values []string) []mailtrapAddress {
@@ -1571,6 +1687,14 @@ func makeProjectMap(projects []ProjectConfig) map[string]ProjectConfig {
 		projectMap[project.Key] = project
 	}
 	return projectMap
+}
+
+func makeProviderMap(providers []ProviderConfig) map[string]ProviderConfig {
+	providerMap := make(map[string]ProviderConfig, len(providers))
+	for _, provider := range providers {
+		providerMap[provider.Name] = provider
+	}
+	return providerMap
 }
 
 func splitCSV(value string) []string {

@@ -15,31 +15,19 @@ database:
   # /var/lib/relay-house/relay-house.db
   path: relay-house.db
 
-projects:
-  - # Public project identifier sent by browser JavaScript in the JSON "project"
-    # field. This is not a secret, but it should be stable across restarts.
-    key: replace-with-public-project-key
-    name: main
+providers:
+  - # Provider instance name referenced by projects[].provider. Names must be
+    # unique. Multiple providers can use the same type.
+    name: smtp-main
+    type: smtp
 
-    # Server-controlled From header used for this project's outgoing email.
+    # Server-controlled From header and destinations. The browser cannot choose
+    # arbitrary senders or recipients.
     from: Website Contact <contact@example.com>
-
-    # Exact browser Origin values allowed to submit forms for this project.
-    allowed_origins:
-      - https://example.com
-      - https://www.example.com
-
-    # Server-controlled destination addresses for this project. The browser
-    # cannot choose recipients.
     recipients:
       - Website Owner <you@example.com>
 
-mail:
-  # Supported values: smtp, mailtrap.
-  delivery_provider: smtp
-
-  smtp:
-    # Required when delivery_provider is smtp.
+    # Required for smtp providers.
     host: smtp.example.com
     port: 587
     username: smtp-user
@@ -48,13 +36,19 @@ mail:
     # Set true only for SMTP servers that require plaintext auth without TLS.
     insecure_plain_auth: false
 
-  mailtrap:
-    # Required when delivery_provider is mailtrap.
-    api_url: https://send.api.mailtrap.io/api/send
-    api_token: ""
+projects:
+  - # Public project identifier sent by browser JavaScript in the JSON "project"
+    # field. This is not a secret, but it should be stable across restarts.
+    key: replace-with-public-project-key
+    name: main
 
-    # Optional blind-copy recipients for Mailtrap API delivery.
-    bcc: []
+    # Exact browser Origin values allowed to submit forms for this project.
+    allowed_origins:
+      - https://example.com
+      - https://www.example.com
+
+    # Selects one provider instance by name.
+    provider: smtp-main
 
 turnstile:
   # Optional Cloudflare Turnstile secret. If set, each request must include

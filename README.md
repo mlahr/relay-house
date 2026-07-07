@@ -1,12 +1,12 @@
 # RelayHouse
 
-Self-hosted email relay for browser-based website forms.
+Self-hosted form relay for browser-based website forms.
 
 ## What It Does
 
 - Accepts `POST /v1/send` from configured public website origins.
 - Stores submissions, delivery jobs, attempts, retries, and status in SQLite.
-- Sends mail through SMTP or Mailtrap's transactional REST API.
+- Delivers submissions through SMTP, Mailtrap's transactional REST API, or Telegram.
 - Retries failed deliveries with exponential backoff.
 - Keeps full submissions in SQLite for a configurable retention window.
 - Uses hashed client IPs for rate limiting.
@@ -19,7 +19,7 @@ Docker:
 ```sh
 cp config.example.yaml config.yaml
 cp .env.example .env
-# edit config.yaml and optional transport overrides in .env
+# edit config.yaml and optional runtime overrides in .env
 docker compose up --build
 ```
 
@@ -73,8 +73,9 @@ Success returns `202 Accepted`:
 
 ## Configuration
 
-RelayHouse project definitions are configured with YAML. Transport and runtime
-settings can be overridden with environment variables.
+RelayHouse provider instances and project definitions are configured with YAML.
+Runtime settings can be overridden with environment variables. Provider
+credentials and destinations are YAML-only.
 
 Start from the example YAML file:
 
@@ -84,24 +85,24 @@ $EDITOR config.yaml
 relay-house -config config.yaml
 ```
 
-For Docker/local transport overrides, start from `.env.example`:
+For Docker/local runtime overrides, start from `.env.example`:
 
 ```sh
 cp .env.example .env
 $EDITOR .env
 ```
 
-Transport/runtime configuration precedence is:
+Runtime configuration precedence is:
 
 ```txt
 compiled defaults < YAML config from -config < environment variables
 ```
 
-That means environment variables override matching non-project YAML values.
+That means environment variables override matching runtime YAML values. Provider settings are not overridden by environment variables.
 
 Each `projects[].key` is a public identifier used by your website JavaScript. It is not a secret.
 
-`projects[].from` and `projects[].recipients` are server-controlled. The browser cannot choose arbitrary senders or recipients.
+Each project selects one provider instance with `projects[].provider`. Provider instances own their destinations: SMTP and Mailtrap providers own `from` and `recipients`, and Telegram providers own `chat_ids`.
 
 `TURNSTILE_SECRET` is optional. If set, requests must include `turnstileToken`.
 
@@ -113,20 +114,24 @@ Set `projects[].key` and `security.ip_hash_secret` explicitly in production so t
 | --- | --- | --- | --- |
 | `http.address` | `ADDR` | `:8080` | HTTP listen address. |
 | `database.path` | `DATABASE_PATH` | `relay-house.db` | SQLite database path. |
+| `providers[].name` | none | none | Required. Unique provider instance name. |
+| `providers[].type` | none | none | Required. Supported values: `smtp`, `mailtrap`, `telegram`. |
+| `providers[].from` | none | none | Required for `smtp` and `mailtrap`. Server-controlled sender address. |
+| `providers[].recipients` | none | none | Required for `smtp` and `mailtrap`. Destination email addresses. |
+| `providers[].host` | none | none | Required for `smtp`. SMTP host. |
+| `providers[].port` | none | `587` | SMTP port. |
+| `providers[].username` | none | none | Required for `smtp`. |
+| `providers[].password` | none | none | Required for `smtp`. |
+| `providers[].insecure_plain_auth` | none | `false` | SMTP only. Use only for SMTP servers requiring plaintext auth without TLS. |
+| `providers[].api_url` | none | `https://send.api.mailtrap.io/api/send` | Mailtrap API URL. |
+| `providers[].api_token` | none | none | Required for `mailtrap`. |
+| `providers[].bcc` | none | empty | Optional Mailtrap BCC recipients. |
+| `providers[].bot_token` | none | none | Required for `telegram`. |
+| `providers[].chat_ids` | none | empty | Required for `telegram`. |
 | `projects[].key` | none | none | Required. Public project key expected in request JSON. |
 | `projects[].name` | none | project key | Stored project display name. |
-| `projects[].from` | none | none | Required. Server-controlled sender address for this project. |
 | `projects[].allowed_origins` | none | none | Required. Exact browser origins for this project. |
-| `projects[].recipients` | none | none | Required. Destination addresses for this project. |
-| `mail.delivery_provider` | `DELIVERY_PROVIDER` | `smtp` | Supported values: `smtp`, `mailtrap`. |
-| `mail.smtp.host` | `SMTP_HOST` | none | Required when `mail.delivery_provider` is `smtp`. |
-| `mail.smtp.port` | `SMTP_PORT` | `587` | SMTP port. |
-| `mail.smtp.username` | `SMTP_USERNAME` | none | Required when `mail.delivery_provider` is `smtp`. |
-| `mail.smtp.password` | `SMTP_PASSWORD` | none | Required when `mail.delivery_provider` is `smtp`. |
-| `mail.smtp.insecure_plain_auth` | `SMTP_INSECURE_PLAIN_AUTH` | `false` | Use only for SMTP servers requiring plaintext auth without TLS. |
-| `mail.mailtrap.api_url` | `MAILTRAP_API_URL` | `https://send.api.mailtrap.io/api/send` | Required when `mail.delivery_provider` is `mailtrap`. |
-| `mail.mailtrap.api_token` | `MAILTRAP_API_TOKEN` | none | Required when `mail.delivery_provider` is `mailtrap`. |
-| `mail.mailtrap.bcc` | `MAILTRAP_BCC` | empty | Optional BCC recipients for Mailtrap API delivery. |
+| `projects[].provider` | none | none | Required. References `providers[].name`. |
 | `turnstile.secret` | `TURNSTILE_SECRET` | empty | Optional Cloudflare Turnstile secret. |
 | `rate_limit.per_minute` | `RATE_LIMIT_PER_MINUTE` | `5` | Limit per project and hashed client IP. |
 | `rate_limit.per_day` | `RATE_LIMIT_PER_DAY` | `100` | Limit per project and hashed client IP. |
@@ -138,20 +143,21 @@ Set `projects[].key` and `security.ip_hash_secret` explicitly in production so t
 ### Minimal SMTP YAML
 
 ```yaml
-projects:
-  - key: replace-with-public-project-key
+providers:
+  - name: smtp-main
+    type: smtp
     from: Website Contact <contact@example.com>
-    allowed_origins:
-      - https://example.com
     recipients:
       - Website Owner <you@example.com>
-
-mail:
-  delivery_provider: smtp
-  smtp:
     host: smtp.example.com
     username: smtp-user
     password: smtp-password
+
+projects:
+  - key: replace-with-public-project-key
+    allowed_origins:
+      - https://example.com
+    provider: smtp-main
 
 security:
   ip_hash_secret: replace-with-random-secret
@@ -160,18 +166,39 @@ security:
 ### Minimal Mailtrap YAML
 
 ```yaml
-projects:
-  - key: replace-with-public-project-key
+providers:
+  - name: mailtrap-main
+    type: mailtrap
     from: Website Contact <contact@example.com>
-    allowed_origins:
-      - https://example.com
     recipients:
       - Website Owner <you@example.com>
-
-mail:
-  delivery_provider: mailtrap
-  mailtrap:
     api_token: your-token
+
+projects:
+  - key: replace-with-public-project-key
+    allowed_origins:
+      - https://example.com
+    provider: mailtrap-main
+
+security:
+  ip_hash_secret: replace-with-random-secret
+```
+
+### Minimal Telegram YAML
+
+```yaml
+providers:
+  - name: telegram-main
+    type: telegram
+    bot_token: your-bot-token
+    chat_ids:
+      - 123456789
+
+projects:
+  - key: replace-with-public-project-key
+    allowed_origins:
+      - https://example.com
+    provider: telegram-main
 
 security:
   ip_hash_secret: replace-with-random-secret
@@ -179,26 +206,13 @@ security:
 
 ## Delivery Providers
 
-SMTP:
+SMTP providers use `type: smtp` and require `from`, `recipients`, `host`, `username`, and `password`.
 
-```env
-DELIVERY_PROVIDER=smtp
-SMTP_HOST=smtp.example.com
-SMTP_PORT=587
-SMTP_USERNAME=smtp-user
-SMTP_PASSWORD=smtp-password
-```
+Mailtrap providers use `type: mailtrap` and require `from`, `recipients`, and `api_token`.
 
-Mailtrap REST API:
+For Mailtrap Sandbox, set `api_url` to the sandbox send endpoint for your inbox.
 
-```env
-DELIVERY_PROVIDER=mailtrap
-MAILTRAP_API_TOKEN=your-token
-MAILTRAP_API_URL=https://send.api.mailtrap.io/api/send
-MAILTRAP_BCC=optional@example.com
-```
-
-For Mailtrap Sandbox, set `MAILTRAP_API_URL` to the sandbox send endpoint for your inbox.
+Telegram providers use `type: telegram` and require `bot_token` and `chat_ids`.
 
 ## Inspect the Database
 

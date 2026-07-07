@@ -4,30 +4,25 @@ http:
 database:
   path: /var/lib/relay-house/relay-house.db
 
-projects:
-  - key: replace-with-public-project-key
-    name: main
+providers:
+  - name: smtp-main
+    type: smtp
     from: Website Contact <contact@example.com>
-    allowed_origins:
-      - https://example.com
-      - https://www.example.com
     recipients:
       - you@example.com
-
-mail:
-  delivery_provider: smtp
-
-  smtp:
     host: smtp.example.com
     port: 587
     username: smtp-user
     password: smtp-password
     insecure_plain_auth: false
 
-  mailtrap:
-    api_url: https://send.api.mailtrap.io/api/send
-    api_token: ""
-    bcc: []
+projects:
+  - key: replace-with-public-project-key
+    name: main
+    allowed_origins:
+      - https://example.com
+      - https://www.example.com
+    provider: smtp-main
 
 turnstile:
   secret: ""

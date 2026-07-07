@@ -44,7 +44,8 @@ func TestPrintUsage(t *testing.T) {
 		"-config, --config PATH",
 		"events",
 		"Validation-required settings:",
-		"MAILTRAP_API_TOKEN",
+		"providers[].name",
+		"projects[].provider",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("usage output missing %q:\n%s", want, output)
@@ -222,22 +223,22 @@ func TestSendMailtrap(t *testing.T) {
 	}))
 	defer server.Close()
 
-	app := &App{
-		cfg: Config{
-			MailtrapAPIURL:   server.URL,
-			MailtrapAPIToken: "secret-token",
-			MailtrapBCC:      []string{"Audit <audit@example.com>"},
-		},
+	provider := ProviderConfig{
+		Name:             "mailtrap-main",
+		Type:             "mailtrap",
+		From:             "Website Contact <contact@example.com>",
+		Recipients:       []string{"Owner <owner@example.com>"},
+		MailtrapAPIURL:   server.URL,
+		MailtrapAPIToken: "secret-token",
+		MailtrapBCC:      []string{"Audit <audit@example.com>"},
 	}
 
-	response, err := app.sendMailtrap(context.Background(), job{
-		From:       "Website Contact <contact@example.com>",
-		Recipients: []string{"Owner <owner@example.com>"},
-		Name:       "Jane Doe",
-		Email:      "jane@example.net",
-		Subject:    "Subject",
-		Message:    "Message body",
-	})
+	response, err := (&App{}).sendMailtrap(context.Background(), job{
+		Name:    "Jane Doe",
+		Email:   "jane@example.net",
+		Subject: "Subject",
+		Message: "Message body",
+	}, provider)
 	if err != nil {
 		t.Fatalf("sendMailtrap returned error: %v", err)
 	}
@@ -261,34 +262,113 @@ func TestSendMailtrap(t *testing.T) {
 	}
 }
 
-func TestLoadConfigMailtrapDoesNotRequireSMTP(t *testing.T) {
+func TestSendTelegram(t *testing.T) {
+	var gotPaths []string
+	var gotPayloads []map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		gotPaths = append(gotPaths, r.URL.Path)
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		gotPayloads = append(gotPayloads, payload)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":123}}`))
+	}))
+	defer server.Close()
+
+	provider := ProviderConfig{
+		Name:             "telegram-main",
+		Type:             "telegram",
+		TelegramBotToken: "secret-token",
+		TelegramChatIDs:  []int64{123, -456},
+		TelegramAPIBase:  server.URL,
+	}
+
+	response, err := (&App{}).sendTelegram(context.Background(), job{
+		ProjectKey: "project-a",
+		Name:       "Jane Doe",
+		Email:      "jane@example.net",
+		Subject:    "Subject",
+		Message:    "Message body",
+	}, provider)
+	if err != nil {
+		t.Fatalf("sendTelegram returned error: %v", err)
+	}
+	if response != "sent to 2 telegram chat(s)" {
+		t.Fatalf("response = %q", response)
+	}
+	if len(gotPayloads) != 2 {
+		t.Fatalf("len(gotPayloads) = %d, want 2", len(gotPayloads))
+	}
+	for i, wantChatID := range []float64{123, -456} {
+		if gotPaths[i] != "/botsecret-token/sendMessage" {
+			t.Fatalf("path[%d] = %q", i, gotPaths[i])
+		}
+		if gotPayloads[i]["chat_id"] != wantChatID {
+			t.Fatalf("chat_id[%d] = %#v, want %#v", i, gotPayloads[i]["chat_id"], wantChatID)
+		}
+		text, ok := gotPayloads[i]["text"].(string)
+		if !ok {
+			t.Fatalf("text[%d] = %#v, want string", i, gotPayloads[i]["text"])
+		}
+		for _, want := range []string{"Project: project-a", "From: Jane Doe <jane@example.net>", "Subject: Subject", "Message body"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("telegram text missing %q:\n%s", want, text)
+			}
+		}
+	}
+}
+
+func TestSendTelegramReportsAPIError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"ok":false,"description":"Bad Request: chat not found"}`))
+	}))
+	defer server.Close()
+
+	provider := ProviderConfig{
+		Name:             "telegram-main",
+		Type:             "telegram",
+		TelegramBotToken: "secret-token",
+		TelegramChatIDs:  []int64{123},
+		TelegramAPIBase:  server.URL,
+	}
+
+	response, err := (&App{}).sendTelegram(context.Background(), job{ProjectKey: "project-a"}, provider)
+	if err == nil {
+		t.Fatal("sendTelegram returned nil error, want Telegram API error")
+	}
+	if !strings.Contains(err.Error(), "Bad Request: chat not found") {
+		t.Fatalf("error = %v", err)
+	}
+	if !strings.Contains(response, "chat not found") {
+		t.Fatalf("response = %q", response)
+	}
+}
+
+func TestLoadConfigRejectsMissingProviders(t *testing.T) {
 	clearConfigEnv(t)
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	writeTestConfig(t, configPath, `
 projects:
   - key: test-project
     name: test
-    from: Website Contact <contact@example.com>
     allowed_origins:
       - https://example.com
-    recipients:
-      - owner@example.com
-mail:
-  delivery_provider: mailtrap
-  mailtrap:
-    api_token: yaml-token
+    provider: missing-provider
 security:
   ip_hash_secret: secret
 `)
-	t.Setenv("DELIVERY_PROVIDER", "mailtrap")
-	t.Setenv("MAILTRAP_API_TOKEN", "secret-token")
 
-	cfg, err := loadConfigFromArgs([]string{"--config", configPath})
-	if err != nil {
-		t.Fatalf("loadConfig returned error: %v", err)
-	}
-	if cfg.DeliveryProvider != "mailtrap" {
-		t.Fatalf("DeliveryProvider = %q", cfg.DeliveryProvider)
+	_, err := loadConfigFromArgs([]string{"--config", configPath})
+	if err == nil || !strings.Contains(err.Error(), "at least one provider is required") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -300,28 +380,32 @@ http:
   address: 127.0.0.1:18080
 database:
   path: /var/lib/relay-house/relay-house.db
-projects:
-  - key: yaml-project
-    name: yaml-site
+providers:
+  - name: mailtrap-primary
+    type: mailtrap
     from: Website Contact <contact@example.com>
-    allowed_origins:
-      - https://example.com
     recipients:
       - Owner <owner@example.com>
-  - key: second-project
-    name: second-site
-    from: Second Contact <second@example.com>
-    allowed_origins:
-      - https://second.example.com
-    recipients:
-      - Second Owner <owner2@example.com>
-mail:
-  delivery_provider: mailtrap
-  mailtrap:
     api_url: https://send.api.mailtrap.io/api/send
     api_token: yaml-token
     bcc:
       - Audit <audit@example.com>
+  - name: telegram-main
+    type: telegram
+    bot_token: telegram-token
+    chat_ids:
+      - 123
+projects:
+  - key: yaml-project
+    name: yaml-site
+    allowed_origins:
+      - https://example.com
+    provider: mailtrap-primary
+  - key: second-project
+    name: second-site
+    allowed_origins:
+      - https://second.example.com
+    provider: telegram-main
 rate_limit:
   per_minute: 9
   per_day: 90
@@ -344,17 +428,137 @@ security:
 	if cfg.DatabasePath != "/var/lib/relay-house/relay-house.db" {
 		t.Fatalf("DatabasePath = %q", cfg.DatabasePath)
 	}
-	if len(cfg.Projects) != 2 {
-		t.Fatalf("len(Projects) = %d", len(cfg.Projects))
+	if len(cfg.Providers) != 2 || cfg.Providers[0].Name != "mailtrap-primary" || cfg.Providers[0].MailtrapAPIToken != "yaml-token" {
+		t.Fatalf("Providers = %#v", cfg.Providers)
 	}
-	if cfg.Projects[0].Key != "yaml-project" || cfg.Projects[0].Name != "yaml-site" || cfg.Projects[0].From != "Website Contact <contact@example.com>" {
-		t.Fatalf("project[0] = %#v", cfg.Projects[0])
-	}
-	if cfg.DeliveryProvider != "mailtrap" || cfg.MailtrapAPIToken != "yaml-token" {
-		t.Fatalf("mailtrap config = %#v", cfg)
+	if len(cfg.Projects) != 2 || cfg.Projects[0].ProviderName != "mailtrap-primary" || cfg.Projects[1].ProviderName != "telegram-main" {
+		t.Fatalf("Projects = %#v", cfg.Projects)
 	}
 	if cfg.RateMinute != 9 || cfg.RateDay != 90 || cfg.MaxRetries != 7 || cfg.WorkerInterval.Seconds() != 11 || cfg.RetentionDays != 45 {
 		t.Fatalf("numeric config = %#v", cfg)
+	}
+}
+
+func TestLoadConfigRejectsDuplicateProviderNames(t *testing.T) {
+	clearConfigEnv(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, configPath, `
+providers:
+  - name: duplicate
+    type: telegram
+    bot_token: one
+    chat_ids: [123]
+  - name: duplicate
+    type: telegram
+    bot_token: two
+    chat_ids: [456]
+projects:
+  - key: test-project
+    allowed_origins:
+      - https://example.com
+    provider: duplicate
+security:
+  ip_hash_secret: secret
+`)
+
+	_, err := loadConfigFromArgs([]string{"--config", configPath})
+	if err == nil || !strings.Contains(err.Error(), `duplicate provider name "duplicate"`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadConfigRejectsUnsupportedProviderType(t *testing.T) {
+	clearConfigEnv(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, configPath, `
+providers:
+  - name: push-main
+    type: push
+projects:
+  - key: test-project
+    allowed_origins:
+      - https://example.com
+    provider: push-main
+security:
+  ip_hash_secret: secret
+`)
+
+	_, err := loadConfigFromArgs([]string{"--config", configPath})
+	if err == nil || !strings.Contains(err.Error(), `providers[0].type "push" is unsupported`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadConfigRejectsProjectWithoutProvider(t *testing.T) {
+	clearConfigEnv(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, configPath, `
+providers:
+  - name: telegram-main
+    type: telegram
+    bot_token: yaml-token
+    chat_ids: [123]
+projects:
+  - key: test-project
+    allowed_origins:
+      - https://example.com
+security:
+  ip_hash_secret: secret
+`)
+
+	_, err := loadConfigFromArgs([]string{"--config", configPath})
+	if err == nil || !strings.Contains(err.Error(), "projects[0].provider is required") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadConfigRejectsUnknownProjectProvider(t *testing.T) {
+	clearConfigEnv(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, configPath, `
+providers:
+  - name: telegram-main
+    type: telegram
+    bot_token: yaml-token
+    chat_ids: [123]
+projects:
+  - key: test-project
+    allowed_origins:
+      - https://example.com
+    provider: missing
+security:
+  ip_hash_secret: secret
+`)
+
+	_, err := loadConfigFromArgs([]string{"--config", configPath})
+	if err == nil || !strings.Contains(err.Error(), `projects[0].provider "missing" is not defined`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadConfigRejectsEmailProviderWithoutRecipients(t *testing.T) {
+	clearConfigEnv(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, configPath, `
+providers:
+  - name: smtp-main
+    type: smtp
+    from: Website Contact <contact@example.com>
+    host: smtp.example.com
+    username: smtp-user
+    password: smtp-password
+projects:
+  - key: test-project
+    allowed_origins:
+      - https://example.com
+    provider: smtp-main
+security:
+  ip_hash_secret: secret
+`)
+
+	_, err := loadConfigFromArgs([]string{"--config", configPath})
+	if err == nil || !strings.Contains(err.Error(), "providers[0].recipients is required") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -370,12 +574,12 @@ func TestConfigExampleYAMLLoads(t *testing.T) {
 	if cfg.DatabasePath != "relay-house.db" {
 		t.Fatalf("DatabasePath = %q", cfg.DatabasePath)
 	}
-	if cfg.DeliveryProvider != "smtp" || cfg.SMTPHost != "smtp.example.com" {
+	if len(cfg.Providers) == 0 || cfg.Providers[0].Name != "smtp-main" || cfg.Providers[0].SMTPHost != "smtp.example.com" {
 		t.Fatalf("provider config = %#v", cfg)
 	}
 }
 
-func TestEnvOverridesYAMLConfig(t *testing.T) {
+func TestEnvOverridesRuntimeYAMLConfigOnly(t *testing.T) {
 	clearConfigEnv(t)
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	writeTestConfig(t, configPath, `
@@ -383,17 +587,18 @@ http:
   address: 127.0.0.1:18080
 database:
   path: yaml.db
-projects:
-  - key: yaml-project
+providers:
+  - name: mailtrap-main
+    type: mailtrap
     from: Website Contact <contact@example.com>
-    allowed_origins:
-      - https://example.com
     recipients:
       - owner@example.com
-mail:
-  delivery_provider: mailtrap
-  mailtrap:
     api_token: yaml-token
+projects:
+  - key: yaml-project
+    allowed_origins:
+      - https://example.com
+    provider: mailtrap-main
 security:
   ip_hash_secret: yaml-secret
 `)
@@ -410,31 +615,69 @@ security:
 	if cfg.Addr != ":19090" {
 		t.Fatalf("Addr = %q", cfg.Addr)
 	}
-	if cfg.DeliveryProvider != "smtp" || cfg.SMTPHost != "smtp.example.com" {
-		t.Fatalf("provider config = %#v", cfg)
+	if cfg.Providers[0].Type != "mailtrap" || cfg.Providers[0].MailtrapAPIToken != "yaml-token" {
+		t.Fatalf("provider env variables unexpectedly changed named provider config: %#v", cfg.Providers[0])
 	}
 }
 
-func TestLoadConfigRejectsMissingProjectFrom(t *testing.T) {
+func TestLoadConfigAcceptsTelegramProviderWithoutEmailFields(t *testing.T) {
 	clearConfigEnv(t)
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	writeTestConfig(t, configPath, `
+providers:
+  - name: telegram-main
+    type: telegram
+    bot_token: yaml-token
+    chat_ids:
+      - 123
 projects:
   - key: yaml-project
     allowed_origins:
       - https://example.com
-    recipients:
-      - owner@example.com
-mail:
-  delivery_provider: mailtrap
-  mailtrap:
-    api_token: yaml-token
+    provider: telegram-main
 security:
   ip_hash_secret: yaml-secret
 `)
-	_, err := loadConfigFromArgs([]string{"--config", configPath})
-	if err == nil || !strings.Contains(err.Error(), "projects[0].from is required") {
-		t.Fatalf("error = %v", err)
+	cfg, err := loadConfigFromArgs([]string{"--config", configPath})
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs returned error: %v", err)
+	}
+	if cfg.Providers[0].Type != "telegram" {
+		t.Fatalf("Providers = %#v", cfg.Providers)
+	}
+}
+
+func TestLoadConfigAcceptsMultipleProvidersOfSameType(t *testing.T) {
+	clearConfigEnv(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, configPath, `
+providers:
+  - name: telegram-a
+    type: telegram
+    bot_token: token-a
+    chat_ids: [123]
+  - name: telegram-b
+    type: telegram
+    bot_token: token-b
+    chat_ids: [456]
+projects:
+  - key: project-a
+    allowed_origins:
+      - https://a.example.com
+    provider: telegram-a
+  - key: project-b
+    allowed_origins:
+      - https://b.example.com
+    provider: telegram-b
+security:
+  ip_hash_secret: yaml-secret
+`)
+	cfg, err := loadConfigFromArgs([]string{"--config", configPath})
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs returned error: %v", err)
+	}
+	if len(cfg.Providers) != 2 || cfg.Providers[0].Name != "telegram-a" || cfg.Providers[1].Name != "telegram-b" {
+		t.Fatalf("Providers = %#v", cfg.Providers)
 	}
 }
 
@@ -442,23 +685,22 @@ func TestLoadConfigRejectsDuplicateProjectKeys(t *testing.T) {
 	clearConfigEnv(t)
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	writeTestConfig(t, configPath, `
-projects:
-  - key: duplicate
-    from: First <first@example.com>
-    allowed_origins:
-      - https://example.com
+providers:
+  - name: mailtrap-main
+    type: mailtrap
+    from: Website Contact <contact@example.com>
     recipients:
       - owner@example.com
+    api_token: yaml-token
+projects:
   - key: duplicate
-    from: Second <second@example.com>
+    allowed_origins:
+      - https://example.com
+    provider: mailtrap-main
+  - key: duplicate
     allowed_origins:
       - https://second.example.com
-    recipients:
-      - owner2@example.com
-mail:
-  delivery_provider: mailtrap
-  mailtrap:
-    api_token: yaml-token
+    provider: mailtrap-main
 security:
   ip_hash_secret: yaml-secret
 `)
@@ -479,8 +721,79 @@ func TestProjectEnvVarsDoNotConfigureProjects(t *testing.T) {
 	t.Setenv("IP_HASH_SECRET", "secret")
 
 	_, err := loadConfig()
-	if err == nil || !strings.Contains(err.Error(), "at least one project is required") {
+	if err == nil || !strings.Contains(err.Error(), "at least one provider is required") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestClaimJobUsesProjectProvider(t *testing.T) {
+	cfg, err := validateConfig(Config{
+		Providers: []ProviderConfig{
+			{
+				Name:             "telegram-a",
+				Type:             "telegram",
+				TelegramBotToken: "token-a",
+				TelegramChatIDs:  []int64{123},
+			},
+			{
+				Name:             "telegram-b",
+				Type:             "telegram",
+				TelegramBotToken: "token-b",
+				TelegramChatIDs:  []int64{456},
+			},
+		},
+		Projects: []ProjectConfig{
+			{
+				Key:            "project-a",
+				AllowedOrigins: []string{"https://a.example.com"},
+				ProviderName:   "telegram-a",
+			},
+			{
+				Key:            "project-b",
+				AllowedOrigins: []string{"https://b.example.com"},
+				ProviderName:   "telegram-b",
+			},
+		},
+		IPHashSecret: "hash-secret",
+	})
+	if err != nil {
+		t.Fatalf("validateConfig returned error: %v", err)
+	}
+	db := openExistingEventDB(t, filepath.Join(t.TempDir(), "relay-house.db"))
+	defer db.Close()
+	app := &App{
+		cfg:         cfg,
+		db:          db,
+		log:         nilLogger(),
+		projectMap:  makeProjectMap(cfg.Projects),
+		providerMap: makeProviderMap(cfg.Providers),
+		now:         func() time.Time { return time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC) },
+	}
+	if err := app.migrate(context.Background()); err != nil {
+		t.Fatalf("migrate returned error: %v", err)
+	}
+	if err := app.seedProjects(context.Background()); err != nil {
+		t.Fatalf("seedProjects returned error: %v", err)
+	}
+	_, err = app.storeSubmission(context.Background(), SendRequest{
+		Project: "project-b",
+		Name:    "Jane Doe",
+		Email:   "jane@example.net",
+		Subject: "Hello",
+		Message: "Message",
+	}, "https://b.example.com", "hash", "agent")
+	if err != nil {
+		t.Fatalf("storeSubmission returned error: %v", err)
+	}
+	j, ok, err := app.claimJob(context.Background())
+	if err != nil {
+		t.Fatalf("claimJob returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("claimJob did not find queued job")
+	}
+	if j.Provider.Name != "telegram-b" || !reflect.DeepEqual(j.Provider.TelegramChatIDs, []int64{456}) {
+		t.Fatalf("job provider = %#v", j.Provider)
 	}
 }
 
@@ -489,16 +802,14 @@ func TestSendUsesPerProjectOriginPolicy(t *testing.T) {
 		{
 			Key:            "project-a",
 			Name:           "Project A",
-			From:           "Project A <a@example.com>",
 			AllowedOrigins: []string{"https://a.example.com"},
-			Recipients:     []string{"Owner A <owner-a@example.com>"},
+			ProviderName:   "mailtrap-main",
 		},
 		{
 			Key:            "project-b",
 			Name:           "Project B",
-			From:           "Project B <b@example.com>",
 			AllowedOrigins: []string{"https://b.example.com"},
-			Recipients:     []string{"Owner B <owner-b@example.com>"},
+			ProviderName:   "mailtrap-main",
 		},
 	})
 	defer closeApp()
@@ -540,16 +851,14 @@ func TestOptionsAllowsOriginFromAnyProject(t *testing.T) {
 		{
 			Key:            "project-a",
 			Name:           "Project A",
-			From:           "Project A <a@example.com>",
 			AllowedOrigins: []string{"https://a.example.com"},
-			Recipients:     []string{"Owner A <owner-a@example.com>"},
+			ProviderName:   "mailtrap-main",
 		},
 		{
 			Key:            "project-b",
 			Name:           "Project B",
-			From:           "Project B <b@example.com>",
 			AllowedOrigins: []string{"https://b.example.com"},
-			Recipients:     []string{"Owner B <owner-b@example.com>"},
+			ProviderName:   "mailtrap-main",
 		},
 	})
 	defer closeApp()
@@ -566,7 +875,7 @@ func TestOptionsAllowsOriginFromAnyProject(t *testing.T) {
 	}
 }
 
-func TestMigrateAddsProjectFromAddressColumn(t *testing.T) {
+func TestMigrateAddsProjectFromAddressColumnForCompatibility(t *testing.T) {
 	db := openExistingEventDB(t, filepath.Join(t.TempDir(), "old.db"))
 	defer db.Close()
 	execSQL(t, db, `
@@ -589,9 +898,8 @@ func TestMigrateAddsProjectFromAddressColumn(t *testing.T) {
 				{
 					Key:            "project-a",
 					Name:           "Project A",
-					From:           "Project A <a@example.com>",
 					AllowedOrigins: []string{"https://a.example.com"},
-					Recipients:     []string{"Owner A <owner-a@example.com>"},
+					ProviderName:   "provider-a",
 				},
 			},
 		},
@@ -608,12 +916,12 @@ func TestMigrateAddsProjectFromAddressColumn(t *testing.T) {
 	if err := db.QueryRow(`SELECT from_address FROM projects WHERE key = 'project-a'`).Scan(&from); err != nil {
 		t.Fatalf("select from_address: %v", err)
 	}
-	if from != "Project A <a@example.com>" {
+	if from != "" {
 		t.Fatalf("from_address = %q", from)
 	}
 }
 
-func TestSeedProjectsRejectsStoredProjectWithoutFromAddress(t *testing.T) {
+func TestSeedProjectsAllowsStoredProjectWithoutFromAddress(t *testing.T) {
 	db := openExistingEventDB(t, filepath.Join(t.TempDir(), "old.db"))
 	defer db.Close()
 	execSQL(t, db, `
@@ -636,9 +944,8 @@ func TestSeedProjectsRejectsStoredProjectWithoutFromAddress(t *testing.T) {
 				{
 					Key:            "new-project",
 					Name:           "Project A",
-					From:           "Project A <a@example.com>",
 					AllowedOrigins: []string{"https://a.example.com"},
-					Recipients:     []string{"Owner A <owner-a@example.com>"},
+					ProviderName:   "provider-a",
 				},
 			},
 		},
@@ -648,9 +955,8 @@ func TestSeedProjectsRejectsStoredProjectWithoutFromAddress(t *testing.T) {
 	if err := app.migrate(context.Background()); err != nil {
 		t.Fatalf("migrate returned error: %v", err)
 	}
-	err := app.seedProjects(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "stored projects missing from_address after migration: old-project") {
-		t.Fatalf("error = %v", err)
+	if err := app.seedProjects(context.Background()); err != nil {
+		t.Fatalf("seedProjects returned error: %v", err)
 	}
 }
 
@@ -702,9 +1008,16 @@ func openSeededEventDBAtPath(t *testing.T, path string) *sql.DB {
 func newTestApp(t *testing.T, projects []ProjectConfig) (*App, func()) {
 	t.Helper()
 	raw := defaultConfig()
+	raw.Providers = []ProviderConfig{
+		{
+			Name:             "mailtrap-main",
+			Type:             "mailtrap",
+			From:             "Website Contact <contact@example.com>",
+			Recipients:       []string{"Owner <owner@example.com>"},
+			MailtrapAPIToken: "secret-token",
+		},
+	}
 	raw.Projects = projects
-	raw.DeliveryProvider = "mailtrap"
-	raw.MailtrapAPIToken = "secret-token"
 	raw.RateMinute = 100
 	raw.RateDay = 100
 	raw.MaxRetries = 5
@@ -715,11 +1028,12 @@ func newTestApp(t *testing.T, projects []ProjectConfig) (*App, func()) {
 	}
 	db := openExistingEventDB(t, filepath.Join(t.TempDir(), "relay-house.db"))
 	app := &App{
-		cfg:        cfg,
-		db:         db,
-		log:        nilLogger(),
-		projectMap: makeProjectMap(cfg.Projects),
-		now:        func() time.Time { return time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC) },
+		cfg:         cfg,
+		db:          db,
+		log:         nilLogger(),
+		projectMap:  makeProjectMap(cfg.Projects),
+		providerMap: makeProviderMap(cfg.Providers),
+		now:         func() time.Time { return time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC) },
 	}
 	if err := app.migrate(context.Background()); err != nil {
 		db.Close()
