@@ -71,6 +71,59 @@ Success returns `202 Accepted`:
 }
 ```
 
+## Health
+
+`GET /healthz` reports whether every configured delivery path is currently
+healthy. The endpoint is unauthenticated and returns provider names and types.
+
+A healthy response uses `200 OK`:
+
+```json
+{
+  "status": "ok",
+  "database": {
+    "status": "ok"
+  },
+  "providers": [
+    {
+      "name": "smtp-main",
+      "type": "smtp",
+      "status": "ok",
+      "live_check": "ok",
+      "live_checked_at": "2026-07-20T10:00:00Z",
+      "last_attempt": "succeeded",
+      "last_attempt_at": "2026-07-20T09:58:00Z"
+    }
+  ],
+  "checked_at": "2026-07-20T10:00:12Z"
+}
+```
+
+The endpoint returns `503 Service Unavailable` when the database or any
+configured provider is unhealthy. Provider failures contain stable
+`reason_codes`; raw external errors and credentials are never returned.
+
+Health is evaluated as follows:
+
+- SQLite must accept a ping, and delivery-attempt history must be readable.
+- SMTP providers must accept a connection and authentication. The probe does
+  not issue SMTP `MAIL`, `RCPT`, or `DATA` commands.
+- Telegram providers must accept a `getMe` authentication request.
+- Mailtrap providers are not called by health checks; their status is derived
+  only from recorded delivery attempts.
+- If a provider has recorded attempts, its most recent attempt must have
+  succeeded. A provider with no recorded attempt passes this condition.
+
+SMTP and Telegram probe results are cached for 60 seconds. Delivery history is
+read on every health request. `succeeded` means that RelayHouse's configured
+provider accepted the attempt; it does not confirm delivery to a recipient's
+inbox.
+
+Possible provider reason codes are `connectivity_failed`,
+`authentication_failed`, `probe_timeout`, `unexpected_response`,
+`latest_attempt_failed`, and `history_unavailable`. Database reason codes are
+`database_unavailable` and `history_unavailable`.
+
 ## Configuration
 
 RelayHouse provider instances and project definitions are configured with YAML.

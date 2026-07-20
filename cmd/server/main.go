@@ -88,6 +88,9 @@ type App struct {
 	projectMap  map[string]ProjectConfig
 	providerMap map[string]ProviderConfig
 	now         func() time.Time
+	healthMu    sync.Mutex
+	healthCache providerHealthCache
+	probeHealth func(context.Context, ProviderConfig) providerLiveHealth
 }
 
 type SendRequest struct {
@@ -819,14 +822,6 @@ func (a *App) requestLog(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		a.log.Info("http.request", "method", r.Method, "path", r.URL.Path, "duration_ms", time.Since(start).Milliseconds())
 	})
-}
-
-func (a *App) health(w http.ResponseWriter, r *http.Request) {
-	if err := a.db.PingContext(r.Context()); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, SendResponse{Status: "unhealthy", Error: "database unavailable"})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (a *App) options(w http.ResponseWriter, r *http.Request) {
